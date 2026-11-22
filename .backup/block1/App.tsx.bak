@@ -1,0 +1,94 @@
+import { useEffect, useRef, useState } from 'react';
+import { useGameStore } from './game/store';
+import TopBar from './components/TopBar';
+import BottomNav, { type Tab } from './components/BottomNav';
+import Sidebar from './components/Sidebar';
+import OfficeScreen from './screens/OfficeScreen';
+import BusinessesScreen from './screens/BusinessesScreen';
+import PropertyScreen from './screens/PropertyScreen';
+import CityScreen from './screens/CityScreen';
+import GamesScreen from './screens/GamesScreen';
+import CasesScreen from './screens/CasesScreen';
+import EventScreen from './screens/EventScreen';
+import OfflineIncomeModal from './components/OfflineIncomeModal';
+import SettingsModal from './components/SettingsModal';
+import { getActiveHoliday } from './game/selectors';
+import { STOCKS } from './data/stocks';
+
+export default function App() {
+  const [tab, setTab] = useState<Tab>('office');
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const theme = useGameStore((s) => s.settings.theme);
+  const resolveOfflineIncome = useGameStore((s) => s.resolveOfflineIncome);
+  const tick = useGameStore((s) => s.tick);
+  const markExit = useGameStore((s) => s.markExit);
+  const didInit = useRef(false);
+
+  useEffect(() => {
+    if (didInit.current) return;
+    didInit.current = true;
+    resolveOfflineIncome();
+  }, [resolveOfflineIncome]);
+
+  useEffect(() => {
+    const id = setInterval(() => tick(1), 1000);
+    return () => clearInterval(id);
+  }, [tick]);
+
+  useEffect(() => {
+    const handleHide = () => markExit();
+    window.addEventListener('beforeunload', handleHide);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') markExit();
+    });
+    return () => {
+      window.removeEventListener('beforeunload', handleHide);
+    };
+  }, [markExit]);
+
+  // Инициализация цен акций при первом запуске + обновление каждые 5 секунд
+  useEffect(() => {
+    const state = useGameStore.getState();
+    if (Object.keys(state.stockPrices).length === 0) {
+      const init: Record<string, number> = {};
+      for (const s of STOCKS) init[s.id] = s.basePrice;
+      useGameStore.setState({ stockPrices: init, stockPricesAt: Date.now() });
+    }
+    const id = setInterval(() => useGameStore.getState().updateStockPrices(), 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Авто-возврат на офис, если активный таб — событие, которое отключилось
+  const activeHoliday = getActiveHoliday(useGameStore.getState());
+  useEffect(() => {
+    if (tab === 'event' && !activeHoliday) setTab('office');
+  }, [tab, activeHoliday]);
+
+  return (
+    <div className={`${theme === 'light' ? 'light' : ''} flex h-screen w-full bg-neutral-950 text-neutral-100`}>
+      {/* Sidebar (Desktop only) */}
+      <Sidebar active={tab} onChange={setTab} />
+
+      {/* Main content area */}
+      <div className="flex flex-1 flex-col overflow-hidden">
+        <TopBar onOpenSettings={() => setSettingsOpen(true)} />
+        <main className="flex-1 overflow-y-auto">
+          {tab === 'office' && <OfficeScreen />}
+          {tab === 'businesses' && <BusinessesScreen />}
+          {tab === 'property' && <PropertyScreen />}
+          {tab === 'cases' && <CasesScreen />}
+          {tab === 'city' && <CityScreen />}
+          {tab === 'games' && <GamesScreen />}
+          {tab === 'event' && <EventScreen />}
+        </main>
+        {/* BottomNav (Mobile only) */}
+        <div className="md:hidden">
+          <BottomNav active={tab} onChange={setTab} />
+        </div>
+      </div>
+
+      <OfflineIncomeModal />
+      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+    </div>
+  );
+}

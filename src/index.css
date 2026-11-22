@@ -1,0 +1,58 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Inter', sans-serif;
+  --font-mono: 'IBM Plex Mono', monospace;
+  
+  --color-app-bg: #F4F1EA;
+  --color-panel: #FBF9F4;
+  --color-text-main: #332B2B;
+  --color-text-muted: #776E64;
+  --color-border-subtle: #D8D0C4;
+  --color-accent: #8B5A3C;
+  --color-accent-hover: #73482F;
+  --color-positive: #4A7C59;
+  --color-negative: #A84A4A;
+  --color-warning: #C28B35;
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background-color: #F4F1EA;
+  color: #332B2B;
+  font-family: 'Inter', sans-serif;
+  overflow: hidden;
+}
+
+/* Глобально убираем любые скругления (оставляем только аватарки и прогресс-бары) */
+[class*="rounded-"]:not(.rounded-full) {
+  border-radius: 0 !important;
+}
+
+/* Убираем жирные тени */
+* {
+  box-shadow: none !important;
+}
+
+/* Специальные классы для табличных данных */
+.data-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #D8D0C4;
+}
+.data-label {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.75rem;
+  color: #776E64;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.data-value {
+  font-family: 'IBM Plex Mono', monospace;
+  font-weight: 500;
+  color: #332B2B;
+}

@@ -1,0 +1,712 @@
+import { create } from 'zustand';
+import { toast } from 'sonner';
+import type { CityState, Quest, SkillState, JobState } from '../types';
+import { JOBS, getJobMultiplier } from '../data/jobs';
+import {
+  BUSINESSES,
+  businessUpgradeCost,
+  starUpgradeCost,
+  baseIncomeOf,
+} from '../data/businesses';
+import { REAL_ESTATE } from '../data/realEstate';
+import { TRANSPORT } from '../data/transport';
+import { COLLECTION_ITEMS } from '../data/collection';
+import { CITY_BUILDINGS } from '../data/cityBuildings';
+import {
+  getCompanyLevel,
+  getDealAmount,
+  getDealCooldownMs,
+  getOfflineFraction,
+  getTotalIncomePerSec,
+  getAnalyticsDoubleChance,
+  getCityIncomePerSec,
+  type SelectorState,
+} from './selectors';
+import { RESEARCH_TREE } from '../data/cityBuildings';
+import { CASES, WHEEL_PRIZES } from '../data/cases';
+import { STOCKS } from '../data/stocks';
+import { ACHIEVEMENTS, pickDailyQuests, PROMO_CODES, QUEST_POOL } from './questsAndAchievements';
+
+const BUSINESS_MAP = Object.fromEntries(
+  BUSINESSES.map((b) => [
+    b.id,
+    {
+      ...b,
+      // @deprecated Для совместимости со старым store.ts. Удалить в Блоке 4.
+      basePrice: (b.startingEquipment ?? 0) + (b.premisesPrice ?? b.fixedCosts * 24),
+    },
+  ])
+);
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function todayKey(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+export interface Notification {
+  id: string;
+  text: string;
+  timestamp: number;
+}
+
+export interface GameState extends SelectorState {
+  companyName: string;
+  avatarEmoji: string;
+  balance: number;
+  quints: number;
+  bitcoins: number;
+  bankDeposit: number;
+  totalEarned: number;
+  lifetimeDeals: number;
+  lifetimeGames: number;
+  lifetimeUpgrades: number;
+  skills: SkillState;
+  lastExitTimestamp: number;
+  lastDealTimestamp: number;
+  lastDailyBonusDate: string | null;
+  dailyStreak: number;
+  registeredAt: number;
+  city: CityState;
+  quests: Quest[];
+  questsDate: string;
+  achievementsClaimed: string[];
+  promoCodesUsed: string[];
+  settings: { theme: 'dark' | 'light'; sound: boolean; haptics: boolean };
+  notifications: Notification[];
+  // TODO(Блок 1): удалить оффлайн-доход. ТЗ запрещает оффлайн-прогресс.
+  // Рефакторинг store, удаление полей и связанного UI — Блок 1.
+  pendingOfflineIncome: number | null;
+  pendingOfflineSeconds: number;
+  favoriteBusinesses: string[];
+  currentJob: string | null;
+  jobs: Record<string, JobState>;
+  lastJobChange: number;
+  lastWorkClick: number;
+  workClicksLeft: number;
+  lastWorkCooldownReset: number;
+  forcedHoliday: string | null;
+
+  // ========== НОВОЕ (Патч 1.1) ==========
+  capitalHistory: { t: number; balance: number }[];
+  lastCapitalSnapshot: number;
+  stocksOwned: Record<string, { amount: number; avgPrice: number }>;
+  stockPrices: Record<string, number>;
+  stockPricesAt: number;
+  // TODO(Блок 1): удалить бустеры. ТЗ запрещает бустеры в игре.
+  // Рефакторинг store, удаление полей и связанного UI — Блок 1.
+  stockBoosterUntil: number;
+  boosterMultiplier: number;
+  casesOpened: number;
+  lastWheelSpin: number;
+  wheelSpinsAvailable: number;
+
+  // actions
+  tick: (deltaSeconds: number) => void;
+  // TODO(Блок 1): удалить оффлайн-доход. ТЗ запрещает оффлайн-прогресс.
+  // Рефакторинг store, удаление полей и связанного UI — Блок 1.
+  resolveOfflineIncome: () => void;
+  clearOfflineModal: () => void;
+  buyBusiness: (id: string) => void;
+  upgradeBusiness: (id: string, amount?: number) => void;
+  upgradeStar: (id: string) => void;
+  buyProperty: (id: string) => void;
+  buyTransport: (id: string) => void;
+  buyCollectionItem: (id: string) => void;
+  buyCityBuilding: (id: string) => void;
+  buyResearch: (id: string) => void;
+  setCityTaxRate: (rate: number) => void;
+  makeDeal: () => { amount: number; doubled: boolean } | null;
+  claimDailyBonus: () => number | null;
+  claimQuest: (id: string) => void;
+  claimAchievement: (id: string) => void;
+  applyPromoCode: (code: string) => { success: boolean; message: string };
+  upgradeSkill: (skill: keyof SkillState) => void;
+  setCompanyName: (name: string) => void;
+  setTheme: (theme: 'dark' | 'light') => void;
+  toggleSetting: (key: 'sound' | 'haptics') => void;
+  setSetting: <K extends keyof GameState['settings']>(
+    key: K,
+    value: GameState['settings'][K]
+  ) => void;
+  toggleFavorite: (id: string) => void;
+  applyGameResult: (delta: number, opts?: { quints?: number }) => void;
+  changeJob: (jobId: string) => void;
+  clickWork: () => void;
+  pushNotification: (text: string) => void;
+  dismissNotification: (id: string) => void;
+  refreshQuestsIfNeeded: () => void;
+  markExit: () => void;
+
+  // DevTools actions
+  addBalance: (amount: number) => void;
+  addQuints: (amount: number) => void;
+  resetCooldowns: () => void;
+  setForcedHoliday: (holiday: string | null) => void;
+  hardReset: () => void;
+
+  // ========== НОВОЕ (Патч 1.1) ==========
+  openCase: (caseId: string) => { reward: { type: string; amount: number } } | null;
+  spinWheel: () => { prize: { type: string; amount: number; label: string } } | null;
+  buyStock: (stockId: string, amount: number) => boolean;
+  sellStock: (stockId: string, amount: number) => { proceeds: number; profit: number } | null;
+  updateStockPrices: () => void;
+}
+
+const initialCity: CityState = {
+  name: 'Новоград',
+  population: 0,
+  happiness: 50,
+  taxRate: 15,
+  treasury: 50_000,
+  buildings: {},
+  research: [],
+};
+
+// TODO(Блок 1): удалить 4 общих навыка (переговоры, аналитика, логистика, маркетинг).
+// Их функции переходят в профессиональные умения (careers.ts). Рефакторинг — Блок 1.
+const initialSkills: SkillState = { negotiations: 0, analytics: 0, logistics: 0, marketing: 0 };
+
+function skillUpgradeCost(skill: keyof SkillState, level: number): number {
+  const base = skill === 'logistics' || skill === 'marketing' ? 20_000 : 15_000;
+  return Math.round(base * Math.pow(1.35, level));
+}
+
+// TODO(Блок 1): удалить 4 общих навыка (переговоры, аналитика, логистика, маркетинг).
+// Их функции переходят в профессиональные умения (careers.ts). Рефакторинг — Блок 1.
+export const SKILL_MAX: Record<keyof SkillState, number> = {
+  negotiations: 100,
+  analytics: 100,
+  logistics: 50,
+  marketing: 50,
+};
+
+export { skillUpgradeCost };
+
+export const useGameStore = create<GameState>()((set, get) => ({
+  companyName: 'Моя Империя',
+  avatarEmoji: '🏢',
+  balance: 100_000,
+  quints: 10,
+  bitcoins: 0,
+  bankDeposit: 0,
+  totalEarned: 0,
+  lifetimeDeals: 0,
+  lifetimeGames: 0,
+  lifetimeUpgrades: 0,
+  skills: initialSkills,
+  lastExitTimestamp: Date.now(),
+  lastDealTimestamp: 0,
+  lastDailyBonusDate: null,
+  dailyStreak: 0,
+  registeredAt: Date.now(),
+  ownedBusinesses: { coffee_house: { id: 'coffee_house', level: 1, stars: 1 } },
+  ownedProperty: [],
+  ownedTransport: [],
+  ownedCollection: [],
+  city: initialCity,
+  quests: pickDailyQuests(Date.now()),
+  questsDate: todayKey(),
+  achievementsClaimed: [],
+  promoCodesUsed: [],
+  settings: { theme: 'dark', sound: true, haptics: true },
+  notifications: [],
+  // TODO(Блок 1): удалить оффлайн-доход. ТЗ запрещает оффлайн-прогресс.
+  // Рефакторинг store, удаление полей и связанного UI — Блок 1.
+  pendingOfflineIncome: null,
+  pendingOfflineSeconds: 0,
+  favoriteBusinesses: [],
+  currentJob: null,
+  jobs: {},
+  lastJobChange: 0,
+  lastWorkClick: 0,
+  workClicksLeft: 50,
+  lastWorkCooldownReset: 0,
+  forcedHoliday: null,
+  capitalHistory: [{ t: Date.now(), balance: 100_000 }],
+  lastCapitalSnapshot: 0,
+  stocksOwned: {},
+  stockPrices: {},
+  stockPricesAt: 0,
+  // TODO(Блок 1): удалить бустеры. ТЗ запрещает бустеры в игре.
+  // Рефакторинг store, удаление полей и связанного UI — Блок 1.
+  stockBoosterUntil: 0,
+  boosterMultiplier: 1,
+  casesOpened: 0,
+  lastWheelSpin: 0,
+  wheelSpinsAvailable: 1,
+
+  pushNotification: (text) =>
+    set((s) => ({
+      notifications: [{ id: `${Date.now()}_${Math.random()}`, text, timestamp: Date.now() }, ...s.notifications].slice(0, 30),
+    })),
+
+  dismissNotification: (id) => set((s) => ({ notifications: s.notifications.filter((n) => n.id !== id) })),
+
+  refreshQuestsIfNeeded: () => {
+    const s = get();
+    const key = todayKey();
+    if (s.questsDate !== key) {
+      set({ quests: pickDailyQuests(Date.now()), questsDate: key });
+    }
+  },
+
+  tick: (deltaSeconds) => {
+    const s = get();
+    const now = Date.now();
+
+    // Восстановление кликов работы (50 кликов раз в 5 минут)
+    if (s.workClicksLeft === 0 && now - s.lastWorkCooldownReset >= 5 * 60 * 1000) {
+      set({ workClicksLeft: 50, lastWorkCooldownReset: now });
+    }
+
+    // Сброс бустера, если время истекло
+if (s.stockBoosterUntil && now >= s.stockBoosterUntil && s.boosterMultiplier !== 1) {
+  set({ boosterMultiplier: 1 });
+}
+
+    const income = getTotalIncomePerSec(s) * deltaSeconds;
+    const cityIncome = getCityIncomePerSec(s) * deltaSeconds;
+
+    // Снэпшот капитала раз в 10 секунд (последние 20 точек для графика)
+    let historyUpdate: { capitalHistory: typeof s.capitalHistory; lastCapitalSnapshot: number } | null = null;
+    if (now - s.lastCapitalSnapshot >= 10_000) {
+      const newPoint = { t: now, balance: s.balance + income };
+      const history = [...s.capitalHistory, newPoint].slice(-20);
+      historyUpdate = { capitalHistory: history, lastCapitalSnapshot: now };
+    }
+
+    if (income > 0 || cityIncome > 0) {
+      set((st) => ({
+        balance: st.balance + income,
+        totalEarned: st.totalEarned + income,
+        city: { ...st.city, treasury: st.city.treasury + cityIncome },
+        quests: st.quests.map((q) => (q.type === 'earn' && !q.claimed ? { ...q, progress: Math.min(q.target, q.progress + income) } : q)),
+        ...(historyUpdate || {}),
+      }));
+    } else if (historyUpdate) {
+      set(historyUpdate);
+    }
+  },
+
+  buyResearch: (id: string) => {
+    const def = RESEARCH_TREE.find((r) => r.id === id);
+    if (!def) return;
+    const s = get();
+    if (s.city.research.includes(id)) return;
+    if (s.quints < def.cost) return;
+    set((st) => ({ quints: st.quints - def.cost, city: { ...st.city, research: [...st.city.research, id] } }));
+  },
+
+  // TODO(Блок 1): удалить оффлайн-доход. ТЗ запрещает оффлайн-прогресс.
+  // Рефакторинг store, удаление полей и связанного UI — Блок 1.
+  resolveOfflineIncome: () => {
+    const s = get();
+    const now = Date.now();
+    const elapsedMs = Math.max(0, now - s.lastExitTimestamp);
+    const cappedMs = Math.min(elapsedMs, 4 * 60 * 60 * 1000);
+    const seconds = cappedMs / 1000;
+    if (seconds < 10) {
+      set({ lastExitTimestamp: now });
+      return;
+    }
+    const incomePerSec = getTotalIncomePerSec(s);
+    const fraction = getOfflineFraction(s);
+    const earned = incomePerSec * seconds * fraction;
+    set({
+      pendingOfflineIncome: earned,
+      pendingOfflineSeconds: seconds,
+      lastExitTimestamp: now,
+    });
+  },
+
+  clearOfflineModal: () => {
+    const s = get();
+    if (s.pendingOfflineIncome) {
+      set((st) => ({
+        balance: st.balance + (st.pendingOfflineIncome || 0),
+        totalEarned: st.totalEarned + (st.pendingOfflineIncome || 0),
+        pendingOfflineIncome: null,
+      }));
+    } else {
+      set({ pendingOfflineIncome: null });
+    }
+  },
+
+  buyBusiness: (_id) => {
+    // TODO(Блок 4): полностью переписать под BusinessRuntime.
+    // Старая модель (basePrice + stars + baseIncome) несовместима с новой
+    // экономикой бизнеса (premisesPrice, startingEquipment, baseRevenue,
+    // fixedCosts, keyResources, staffRoles). Открытие бизнеса — UI часть 2 Блока 4.
+    return;
+  },
+
+  upgradeBusiness: (_id, _amount = 1) => {
+    // TODO(Блок 4): заменить на уровень BusinessRuntime.level с расчётом
+    // через estimateBusinessCosts / IMPROVE_COST_RATIO.
+    return;
+  },
+
+  upgradeStar: (_id) => {
+    // TODO(Блок 4): старая модель «звёзд» несовместима с новой экономикой.
+    // Решение по звёздам: удалить полностью либо переосмыслить как престиж.
+    return;
+  },
+
+  buyProperty: (id) => {
+    const def = REAL_ESTATE.find((r) => r.id === id);
+    if (!def) return;
+    const s = get();
+    if (s.ownedProperty.includes(id)) return;
+    if (s.balance < def.price) return;
+    set((st) => ({ balance: st.balance - def.price, ownedProperty: [...st.ownedProperty, id] }));
+    toast.success(`Приобретено: «${def.name}»`, {
+      description: `+${def.bonusPercent}% к доходу бизнесов`,
+    });
+    get().pushNotification(`Приобретено имущество: «${def.name}»`);
+  },
+
+  buyTransport: (id) => {
+    const def = TRANSPORT.find((t) => t.id === id);
+    if (!def) return;
+    const s = get();
+    if (s.ownedTransport.includes(id)) return;
+    if (s.balance < def.price) return;
+    set((st) => ({ balance: st.balance - def.price, ownedTransport: [...st.ownedTransport, id] }));
+    toast.success(`Приобретено: «${def.name}»`, {
+      description: `+${def.offlineBonusPercent}% оффлайн-доход`,
+    });
+    get().pushNotification(`Приобретён транспорт: «${def.name}»`);
+  },
+
+  buyCollectionItem: (id) => {
+    const def = COLLECTION_ITEMS.find((c) => c.id === id);
+    if (!def) return;
+    const s = get();
+    if (s.ownedCollection.includes(id)) return;
+    if (def.currency === 'rub' && s.balance < def.price) return;
+    if (def.currency === 'quints' && s.quints < def.price) return;
+    set((st) => ({
+      balance: def.currency === 'rub' ? st.balance - def.price : st.balance,
+      quints: def.currency === 'quints' ? st.quints - def.price : st.quints,
+      ownedCollection: [...st.ownedCollection, id],
+    }));
+    toast.success(`Коллекция пополнена: «${def.name}»`, {
+      description: def.bonusText,
+    });
+    get().pushNotification(`Коллекция: «${def.name}»`);
+  },
+
+  buyCityBuilding: (id) => {
+    const def = CITY_BUILDINGS.find((b) => b.id === id);
+    if (!def) return;
+    const s = get();
+    if (s.city.treasury < def.price) return;
+    set((st) => {
+      const count = st.city.buildings[id] || 0;
+      return {
+        city: {
+          ...st.city,
+          treasury: st.city.treasury - def.price,
+          population: st.city.population + def.population,
+          happiness: Math.max(0, Math.min(100, st.city.happiness + def.happiness)),
+          buildings: { ...st.city.buildings, [id]: count + 1 },
+        },
+      };
+    });
+  },
+
+  setCityTaxRate: (rate) => set((st) => ({ city: { ...st.city, taxRate: Math.max(0, Math.min(50, rate)) } })),
+
+  makeDeal: () => {
+    const s = get();
+    const cooldown = getDealCooldownMs(s);
+    const now = Date.now();
+    if (now - s.lastDealTimestamp < cooldown) return null;
+    const base = getDealAmount(s);
+    const chance = getAnalyticsDoubleChance(s);
+    const doubled = Math.random() * 100 < chance;
+    const amount = doubled ? base * 2 : base;
+    set((st) => ({
+      balance: st.balance + amount,
+      totalEarned: st.totalEarned + amount,
+      lastDealTimestamp: now,
+      lifetimeDeals: st.lifetimeDeals + 1,
+      quests: st.quests.map((q) => (q.type === 'deals' && !q.claimed ? { ...q, progress: Math.min(q.target, q.progress + 1) } : q)),
+    }));
+    return { amount, doubled };
+  },
+
+  claimDailyBonus: () => {
+    const s = get();
+    const key = todayKey();
+    if (s.lastDailyBonusDate === key) return null;
+    const yesterday = new Date(Date.now() - DAY_MS).toISOString().slice(0, 10);
+    const streak = s.lastDailyBonusDate === yesterday ? Math.min(7, s.dailyStreak + 1) : 1;
+    const reward = 20_000 * streak * (1 + streak * 0.2);
+    set({ balance: s.balance + reward, lastDailyBonusDate: key, dailyStreak: streak });
+    return reward;
+  },
+
+  claimQuest: (id) => {
+    const s = get();
+    const quest = s.quests.find((q) => q.id === id);
+    if (!quest || quest.claimed || quest.progress < quest.target) return;
+    set((st) => ({
+      balance: st.balance + quest.reward,
+      quests: st.quests.map((q) => (q.id === id ? { ...q, claimed: true } : q)),
+    }));
+  },
+
+  claimAchievement: (id) => {
+    const def = ACHIEVEMENTS.find((a) => a.id === id);
+    if (!def) return;
+    const s = get();
+    if (s.achievementsClaimed.includes(id)) return;
+    let current = 0;
+    if (def.type === 'totalEarned') current = s.totalEarned;
+    if (def.type === 'businessCount') current = Object.keys(s.ownedBusinesses).length;
+    if (def.type === 'companyLevel') current = getCompanyLevel(s);
+    if (def.type === 'dealsCount') current = s.lifetimeDeals;
+    if (def.type === 'gamesPlayed') current = s.lifetimeGames;
+    if (current < def.target) return;
+    set((st) => ({ balance: st.balance + def.reward, achievementsClaimed: [...st.achievementsClaimed, id] }));
+  },
+
+  applyPromoCode: (code) => {
+    const normalized = code.trim().toUpperCase();
+    const s = get();
+    if (s.promoCodesUsed.includes(normalized)) {
+      return { success: false, message: 'Этот промокод уже использован' };
+    }
+    const def = PROMO_CODES[normalized];
+    if (!def) {
+      return { success: false, message: 'Промокод не найден' };
+    }
+    set((st) => ({
+      balance: st.balance + (def.balance || 0),
+      quints: st.quints + (def.quints || 0),
+      promoCodesUsed: [...st.promoCodesUsed, normalized],
+    }));
+    return { success: true, message: def.message };
+  },
+
+  upgradeSkill: (skill) => {
+    const s = get();
+    const level = s.skills[skill];
+    const max = SKILL_MAX[skill];
+    if (level >= max) return;
+    const cost = skillUpgradeCost(skill, level);
+    if (s.balance < cost) return;
+    set((st) => ({ balance: st.balance - cost, skills: { ...st.skills, [skill]: level + 1 } }));
+  },
+
+  setCompanyName: (name) => set({ companyName: name.slice(0, 24) || 'Моя Империя' }),
+  setTheme: (theme) => set((st) => ({ settings: { ...st.settings, theme } })),
+  toggleSetting: (key) => set((st) => ({ settings: { ...st.settings, [key]: !st.settings[key] } })),
+  setSetting: (key, value) => set((st) => ({ settings: { ...st.settings, [key]: value } })),
+  toggleFavorite: (id) =>
+    set((st) => ({
+      favoriteBusinesses: st.favoriteBusinesses.includes(id)
+        ? st.favoriteBusinesses.filter((f) => f !== id)
+        : [...st.favoriteBusinesses, id],
+    })),
+
+  applyGameResult: (delta, opts) => {
+    set((st) => ({
+      balance: Math.max(0, st.balance + delta),
+      totalEarned: delta > 0 ? st.totalEarned + delta : st.totalEarned,
+      quints: st.quints + (opts?.quints || 0),
+      lifetimeGames: st.lifetimeGames + 1,
+      quests: st.quests.map((q) => (q.type === 'games' && !q.claimed ? { ...q, progress: Math.min(q.target, q.progress + 1) } : q)),
+    }));
+  },
+
+  changeJob: (jobId) => {
+    const s = get();
+    const jobChangeCooldown = 24 * 60 * 60 * 1000;
+    const timeSinceJobChange = Date.now() - s.lastJobChange;
+    if (timeSinceJobChange < jobChangeCooldown) return;
+
+    set({
+      currentJob: jobId,
+      lastJobChange: Date.now(),
+    });
+    toast.success('Вы устроились на новую работу!');
+  },
+
+  clickWork: () => {
+    const s = get();
+    if (s.workClicksLeft <= 0) return; // Защита от кликов без лимита
+
+    const jobId = s.currentJob || 'waiter';
+    const jobDef = JOBS.find(j => j.id === jobId) || JOBS[0];
+    const jobState = s.jobs[jobId] || { level: 1, xp: 0 };
+
+    const multiplier = getJobMultiplier(jobState.level);
+    const incomePerClick = jobDef.baseIncome * multiplier * 10; // Доход как за 10 секунд
+
+    const newXp = jobState.xp + 10; // Даем 10 XP за клик
+    const xpNeeded = Math.floor(100 * Math.pow(jobState.level, 1.5));
+
+    let newLevel = jobState.level;
+    let finalXp = newXp;
+
+    // Логика повышения уровня
+    if (finalXp >= xpNeeded && newLevel < 100) {
+      newLevel += 1;
+      finalXp -= xpNeeded;
+      toast.success(`Повышение! Вы теперь: Ур. ${newLevel}`);
+    }
+
+    set((st) => ({
+      workClicksLeft: st.workClicksLeft - 1,
+      balance: st.balance + incomePerClick,
+      totalEarned: st.totalEarned + incomePerClick,
+      lastWorkClick: Date.now(),
+      jobs: {
+        ...st.jobs,
+        [jobId]: { level: newLevel, xp: finalXp }
+      }
+    }));
+  },
+
+  markExit: () => set({ lastExitTimestamp: Date.now() }),
+
+  // ===== DevTools =====
+  addBalance: (amount: number) =>
+    set((s) => ({
+      balance: s.balance + amount,
+      totalEarned: s.totalEarned + amount,
+    })),
+
+  addQuints: (amount: number) => set((s) => ({ quints: s.quints + amount })),
+
+  resetCooldowns: () =>
+    set(() => ({
+      lastDealTimestamp: 0,
+      lastWorkClick: 0,
+      lastJobChange: 0,
+      lastWorkCooldownReset: 0,
+      workClicksLeft: 50,
+    })),
+
+  setForcedHoliday: (holiday: string | null) => set({ forcedHoliday: holiday }),
+
+  // ========== КЕЙСЫ ==========
+  openCase: (caseId) => {
+    const def = CASES.find((c: any) => c.id === caseId);
+    if (!def) return null;
+    const s = get();
+    if (def.currency === 'rub' && s.balance < def.price) return null;
+    if (def.currency === 'quints' && s.quints < def.price) return null;
+
+    // Выбираем случайную награду
+    const rewardDef = def.rewards[Math.floor(Math.random() * def.rewards.length)];
+    const amount = rewardDef.min + Math.random() * (rewardDef.max - rewardDef.min);
+    const reward = { type: rewardDef.type, amount: Math.round(amount) };
+
+    set((st) => ({
+      balance: def.currency === 'rub' ? st.balance - def.price + (reward.type === 'money' ? reward.amount : 0) : st.balance + (reward.type === 'money' ? reward.amount : 0),
+      quints: def.currency === 'quints' ? st.quints - def.price + (reward.type === 'quints' ? reward.amount : 0) : st.quints + (reward.type === 'quints' ? reward.amount : 0),
+      bitcoins: st.bitcoins + (reward.type === 'bitcoin' ? reward.amount : 0),
+      totalEarned: st.totalEarned + (reward.type === 'money' ? reward.amount : 0),
+      casesOpened: st.casesOpened + 1,
+    }));
+    return reward;
+  },
+
+  // ========== КОЛЕСО ФОРТУНЫ ==========
+  spinWheel: () => {
+    const s = get();
+    const now = Date.now();
+    const cooldown = 24 * 60 * 60 * 1000;
+
+    // Проверяем доступность: раз в 24 часа
+    if (now - s.lastWheelSpin < cooldown && s.wheelSpinsAvailable <= 0) return null;
+
+    const totalWeight = WHEEL_PRIZES.reduce((acc: number, p: any) => acc + p.weight, 0);
+    let roll = Math.random() * totalWeight;
+    let chosen = WHEEL_PRIZES[0];
+    for (const prize of WHEEL_PRIZES) {
+      roll -= prize.weight;
+      if (roll <= 0) { chosen = prize; break; }
+    }
+
+    set((st) => ({
+      balance: st.balance + (chosen.reward.type === 'money' ? chosen.reward.amount : 0),
+      quints: st.quints + (chosen.reward.type === 'quints' ? chosen.reward.amount : 0),
+      totalEarned: st.totalEarned + (chosen.reward.type === 'money' ? chosen.reward.amount : 0),
+      stockBoosterUntil: chosen.reward.type === 'booster' ? now + chosen.reward.amount * 1000 : st.stockBoosterUntil,
+      boosterMultiplier: chosen.reward.type === 'booster' ? (chosen.reward.amount === 3600 ? 2 : 3) : st.boosterMultiplier,
+      lastWheelSpin: now,
+      wheelSpinsAvailable: 0,
+    }));
+
+    return { prize: { ...chosen.reward, label: chosen.label } };
+  },
+
+  // ========== ФОНДОВЫЙ РЫНОК ==========
+  buyStock: (stockId, amount) => {
+    const s = get();
+    const price = s.stockPrices[stockId];
+    if (!price || amount <= 0) return false;
+    const totalCost = price * amount;
+    if (s.balance < totalCost) return false;
+    const owned = s.stocksOwned[stockId] || { amount: 0, avgPrice: 0 };
+    const newAmount = owned.amount + amount;
+    const newAvg = (owned.avgPrice * owned.amount + totalCost) / newAmount;
+    set((st) => ({
+      balance: st.balance - totalCost,
+      stocksOwned: { ...st.stocksOwned, [stockId]: { amount: newAmount, avgPrice: newAvg } },
+    }));
+    return true;
+  },
+
+  sellStock: (stockId, amount) => {
+    const s = get();
+    const owned = s.stocksOwned[stockId];
+    if (!owned || owned.amount < amount || amount <= 0) return null;
+    const price = s.stockPrices[stockId] || 0;
+    const proceeds = price * amount;
+    const costBasis = owned.avgPrice * amount;
+    const profit = proceeds - costBasis;
+    const newAmount = owned.amount - amount;
+    set((st) => {
+      const newOwned = { ...st.stocksOwned };
+      if (newAmount <= 0) delete newOwned[stockId];
+      else newOwned[stockId] = { amount: newAmount, avgPrice: owned.avgPrice };
+      return {
+        balance: st.balance + proceeds,
+        totalEarned: st.totalEarned + Math.max(0, profit),
+        stocksOwned: newOwned,
+      };
+    });
+    return { proceeds, profit };
+  },
+
+  updateStockPrices: () => {
+    const s = get();
+    const newPrices: Record<string, number> = { ...s.stockPrices };
+    const now = Date.now();
+    for (const stock of STOCKS) {
+      const prev = newPrices[stock.id] ?? stock.basePrice;
+      // Волатильность ±8% за тик
+      const volatility = (Math.random() - 0.5) * 0.16;
+      const trend = Math.sin(now / 100000 + stock.id.length) * 0.02;
+      const newPrice = Math.max(1, prev * (1 + volatility + trend));
+      newPrices[stock.id] = Math.round(newPrice * 100) / 100;
+    }
+    set({ stockPrices: newPrices, stockPricesAt: now });
+  },
+
+  hardReset: () => {
+    const initial = (useGameStore as any).getInitialState?.();
+    if (initial) set(initial);
+  },
+}));
+
+export { QUEST_POOL };
+
+// Сохраняем "чистое" начальное состояние для сброса
+const _initial = useGameStore.getState();
+(useGameStore as any).getInitialState = () => JSON.parse(JSON.stringify(_initial));

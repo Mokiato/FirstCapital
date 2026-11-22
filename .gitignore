@@ -1,0 +1,9 @@
+node_modules
+# Tauri build artifacts
+src-tauri/target/
+
+# Node modules
+node_modules/
+
+# Distribution folders
+dist/
