@@ -16,6 +16,7 @@ import type { ResourceDef } from '../../data/resources';
 import { RESOURCES_BY_ID } from '../../data/resources';
 import { createWarehouse } from '../logistics/inventory';
 import { TAXES } from '../config/taxes';
+import { getNpcUnitPrice, type PriceContext } from '../economy/pricing';
 
 
 const SECTOR_BY_KIND: Record<BusinessKind, string> = {
@@ -136,6 +137,10 @@ export function findDefForRuntime(
 
 export interface OpeningCostEstimate {
   equipment: number;
+  /** Разовое оборудование (requiredEquipment) по 1.00 × P_market. */
+  requiredEquipment: number;
+  /** Стартовый запас keyResources на 1 месяц по 1.00 × P_market. */
+  initialResources: number;
   premises: number;
   firstMonthRent: number;
   firstMonthUtilities: number;
@@ -147,7 +152,12 @@ export function estimateOpeningCost(
   def: BusinessDef,
   premisesMode: 'rent' | 'owned',
   operatingCapital: number,
+  priceCtx?: PriceContext,
+  procurementDiscount = 0,
 ): OpeningCostEstimate {
+  const ctx: PriceContext = priceCtx ?? { marketIndex: 1, activeEvents: [], monthIndex: 0 };
+  const unitPrice = (id: string) => getNpcUnitPrice(id, ctx, procurementDiscount);
+
   const equipment = def.startingEquipment ?? def.fixedCosts * 2;
   const premises =
     premisesMode === 'owned'
@@ -155,11 +165,24 @@ export function estimateOpeningCost(
       : 0;
   const firstMonthRent = premisesMode === 'rent' ? def.fixedCosts * 0.7 : 0;
   const firstMonthUtilities = def.fixedCosts * 0.3;
+
+  let requiredEquipment = 0;
+  for (const [id, qty] of Object.entries(def.requiredEquipment ?? {})) {
+    requiredEquipment += unitPrice(id) * qty;
+  }
+  let initialResources = 0;
+  for (const [id, qty] of Object.entries(def.keyResources)) {
+    initialResources += unitPrice(id) * qty;
+  }
+
   const total =
-    equipment + premises + firstMonthRent + firstMonthUtilities + operatingCapital;
+    equipment + requiredEquipment + initialResources +
+    premises + firstMonthRent + firstMonthUtilities + operatingCapital;
 
   return {
     equipment,
+    requiredEquipment,
+    initialResources,
     premises,
     firstMonthRent,
     firstMonthUtilities,

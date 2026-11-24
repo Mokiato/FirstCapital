@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useGameStore } from '../game/store';
 import { getCompanyLevel } from '../game/selectors';
 import { useClockStore } from '../game/simulation/clockStore';
-import { Bell, Award, Settings, Pause, Play } from 'lucide-react';
+import { Bell, Award, Settings, ChevronsRight } from 'lucide-react';
 import Modal from './Modal';
 
 function formatTopBarBalance(amount: number) {
@@ -16,15 +16,13 @@ function formatTopBarBalance(amount: number) {
 export default function TopBar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const state = useGameStore();
   const [showNotifs, setShowNotifs] = useState(false);
-  
+
   const level = getCompanyLevel(state);
   const clock = useClockStore((s) => s.clock);
-  const setSpeed = useClockStore((s) => s.setSpeed);
 
   const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
   const monthName = MONTHS[clock.monthIndex % 12];
   const year = Math.floor(clock.monthIndex / 12) + 1;
-  const progress = (clock.monthProgressMs / 600000) * 100;
 
   return (
     <>
@@ -40,7 +38,7 @@ export default function TopBar({ onOpenSettings }: { onOpenSettings: () => void 
               <div className="font-mono text-xs text-[#776E64]">БАЛАНС</div>
             </div>
           </div>
-          
+
           <div className="h-8 w-px bg-[#D8D0C4]" />
 
           <div className="font-mono text-lg font-semibold text-[#332B2B]">
@@ -48,23 +46,20 @@ export default function TopBar({ onOpenSettings }: { onOpenSettings: () => void 
           </div>
         </div>
 
-        {/* ЦЕНТР: Время и Скорость */}
-        <div className="flex items-center gap-6">
-          <div className="flex flex-col items-end">
-            <div className="font-mono text-xs text-[#776E64]">
-              ГОД {year} · {monthName.toUpperCase()}
-            </div>
-            <div className="mt-1 h-1 w-[120px] bg-[#D8D0C4]">
-              <div className="h-full bg-[#8B5A3C]" style={{ width: `${progress}%` }} />
-            </div>
+        {/* ЦЕНТР: Время и ход (GDD v2.0 §3.1: 1 ход = 1 месяц) */}
+        <div className="flex items-center gap-4">
+          <div className="font-mono text-xs text-[#776E64]">
+            ГОД {year} · {monthName.toUpperCase()}
           </div>
-
-          <div className="flex border border-[#D8D0C4] bg-[#F4F1EA]">
-            <button onClick={() => setSpeed(0)} className={`p-2 ${clock.paused ? 'bg-[#8B5A3C] text-white' : 'text-[#776E64] hover:bg-black/5'}`}><Pause size={16} /></button>
-            <button onClick={() => setSpeed(1)} className={`p-2 ${!clock.paused && clock.speed === 1 ? 'bg-[#8B5A3C] text-white' : 'text-[#776E64] hover:bg-black/5'}`}><Play size={16} /></button>
-            <button onClick={() => setSpeed(3)} className={`px-3 font-mono text-xs font-bold ${clock.speed === 3 ? 'bg-[#8B5A3C] text-white' : 'text-[#776E64] hover:bg-black/5'}`}>x3</button>
-            <button onClick={() => setSpeed(6)} className={`px-3 font-mono text-xs font-bold ${clock.speed === 6 ? 'bg-[#8B5A3C] text-white' : 'text-[#776E64] hover:bg-black/5'}`}>x6</button>
-          </div>
+          <button
+            onClick={() => state.endTurn()}
+            disabled={state.gameOver}
+            title="Закрыть месяц: зарплаты, закупки, продажи, налоги, события, рынок"
+            className="flex items-center gap-2 bg-[#8B5A3C] px-4 py-2 font-mono text-xs font-bold text-white hover:bg-[#7A4E33] disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            ЗАВЕРШИТЬ МЕСЯЦ
+            <ChevronsRight size={16} />
+          </button>
         </div>
 
         {/* ПРАВО: Уведомления и Настройки */}
@@ -82,7 +77,7 @@ export default function TopBar({ onOpenSettings }: { onOpenSettings: () => void 
         </div>
       </header>
 
-      {/* Модалка уведомлений (в новом стиле) */}
+      {/* Модалка уведомлений */}
       <Modal open={showNotifs} onClose={() => setShowNotifs(false)} title="УВЕДОМЛЕНИЯ">
         <div className="space-y-2">
           {state.notifications.map((n) => (

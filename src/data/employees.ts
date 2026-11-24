@@ -14,12 +14,12 @@ export interface EmployeeDef {
 
 /** Управляющий персонал — не более 1 на бизнес. */
 const MANAGEMENT_DEFS: EmployeeDef[] = [
-  { role: 'manager',         name: 'Управляющий',         description: 'Автоматизация, налоги, локальные события', salaryMin: 60_000,  salaryMax: 150_000, contractMinMonths: 6, contractMaxMonths: 24 },
-  { role: 'hr',              name: 'HR-специалист',       description: 'Найм, замена, обучение, увольнения',        salaryMin: 40_000,  salaryMax: 100_000, contractMinMonths: 6, contractMaxMonths: 24 },
-  { role: 'logist',          name: 'Логист',              description: 'Скидка на доставку, приоритет заказов',     salaryMin: 50_000,  salaryMax: 120_000, contractMinMonths: 6, contractMaxMonths: 24 },
-  { role: 'marketer',        name: 'Маркетолог бизнеса',  description: '+10–30% к спросу конкретного бизнеса',      salaryMin: 55_000,  salaryMax: 130_000, contractMinMonths: 6, contractMaxMonths: 24 },
-  { role: 'accountant',      name: 'Бухгалтер',           description: 'Снижает риск налоговых штрафов',            salaryMin: 35_000,  salaryMax: 90_000,  contractMinMonths: 6, contractMaxMonths: 24 },
-  { role: 'holding_manager', name: 'Управляющий холдинга', description: 'Координирует управляющих предприятий',      salaryMin: 200_000, salaryMax: 500_000, contractMinMonths: 12, contractMaxMonths: 24 },
+  { role: 'manager',         name: 'Управляющий',         description: 'Автозакупка и автоматизация операций',      salaryMin: 20_000,  salaryMax: 35_000,  contractMinMonths: 6, contractMaxMonths: 24 },
+  { role: 'hr',              name: 'HR-специалист',       description: 'Автонайм рабочих, замена уволившихся',      salaryMin: 15_000,  salaryMax: 25_000,  contractMinMonths: 6, contractMaxMonths: 24 },
+  { role: 'logist',          name: 'Логист',              description: 'Приоритет заказов и маршрутов',             salaryMin: 18_000,  salaryMax: 30_000,  contractMinMonths: 6, contractMaxMonths: 24 },
+  { role: 'marketer',        name: 'Маркетолог бизнеса',  description: '+10–30% к спросу конкретного бизнеса',      salaryMin: 18_000,  salaryMax: 32_000,  contractMinMonths: 6, contractMaxMonths: 24 },
+  { role: 'accountant',      name: 'Бухгалтер',           description: 'Снижает риск налоговых штрафов',            salaryMin: 12_000,  salaryMax: 22_000,  contractMinMonths: 6, contractMaxMonths: 24 },
+  { role: 'holding_manager', name: 'Управляющий холдинга', description: 'Координирует управляющих предприятий',      salaryMin: 120_000, salaryMax: 250_000, contractMinMonths: 12, contractMaxMonths: 24 },
 ];
 
 /**
@@ -81,6 +81,42 @@ const TIER_SALARY: Record<'t1' | 't2' | 't3', [number, number]> = {
   t2: [45_000, 70_000],
   t3: [70_000, 120_000],
 };
+
+/** Вес роли при распределении каталожного ФОТ бизнеса (GDD §9.1). */
+export const WORKER_TIER_WEIGHT: Record<'t1' | 't2' | 't3', number> = {
+  t1: 1.0,
+  t2: 1.35,
+  t3: 2.0,
+};
+
+export function getWorkerTier(role: EmployeeRole): 't1' | 't2' | 't3' {
+  if (WORKER_TIER_3.includes(role)) return 't3';
+  if (WORKER_TIER_2.includes(role)) return 't2';
+  return 't1';
+}
+
+/**
+ * Раскладывает каталожный ФОТ бизнеса по рабочим ролям пропорционально весу.
+ * Управленческие роли сюда не входят — они нанимаются сверх базового ФОТ.
+ */
+export function computeWorkerSalaries(
+  payroll: number,
+  workerStaff: Record<string, number>,
+): Record<string, number> {
+  const entries = Object.entries(workerStaff ?? {}).filter(([, n]) => n > 0);
+  if (entries.length === 0 || payroll <= 0) return {};
+  let totalWeight = 0;
+  for (const [role, count] of entries) {
+    totalWeight += WORKER_TIER_WEIGHT[getWorkerTier(role as EmployeeRole)] * count;
+  }
+  if (totalWeight <= 0) return {};
+  const unit = payroll / totalWeight;
+  const out: Record<string, number> = {};
+  for (const [role] of entries) {
+    out[role] = Math.round(unit * WORKER_TIER_WEIGHT[getWorkerTier(role as EmployeeRole)]);
+  }
+  return out;
+}
 
 const WORKER_NAME_MAP: Record<string, string> = {
   barista: 'Бариста', waiter: 'Официант', cook_brigadier: 'Повар-бригадир',

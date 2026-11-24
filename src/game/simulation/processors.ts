@@ -19,7 +19,7 @@ import type { GameState } from '../store';
 import { getOfficeBonuses } from '../selectors';
 import type { MonthlyProcessor } from './monthlyKernel';
 import { processCompletedMonths } from './monthlyKernel';
-import { getCompanyLevel, getCityIncomePerSec } from '../selectors';
+import { getCompanyLevel } from '../selectors';
 import { moneyAdd, moneyMul, moneyToNumber } from '../domain/money';
 import { BUSINESSES } from '../../data/businesses';
 import { PRODUCTIONS_BY_ID } from '../../data/productions';
@@ -43,7 +43,20 @@ import {
 import { consumeMonthlyResources, withdrawFromWarehouse } from '../logistics/inventory';
 import { settleBusinessMonth } from '../business/operations';
 import { applyWalletTransaction } from '../economy/ledger';
-import { rollMonthlyEvent, getSectorDemandMultiplier, getResourcePriceMultiplier } from '../events/eventEngine';
+import { rollMonthlyEvent, getSectorDemandMultiplier } from '../events/eventEngine';
+import {
+  getNpcUnitPrice,
+  getB2BUnitPrice,
+  getDumpUnitPrice,
+  getExternalDeliveryFee,
+  getInternalDeliveryFee,
+  nextMarketIndex,
+  type PriceContext,
+} from '../economy/pricing';
+import { isFleetOperational, buildFleetInvoice, settleFleetInvoice } from '../logistics/fleet';
+import { allocateB2CDemand, type DemandQuota } from '../economy/b2cDemand';
+import { distributeByLargestRemainder, type B2BDemandAllocation } from '../economy/b2bDemand';
+import { BALANCE } from '../config/balance';
 import { DOMAIN_EVENT_TEMPLATES } from '../events/adapters';
 import { expireContracts } from '../contracts/contractEngine';
 import { generateContracts } from '../contracts/adapters';
@@ -186,6 +199,12 @@ const enterpriseProcessor: MonthlyProcessor<GameState> = {
 
     let balanceDecimal = state.balanceDecimal;
     const journal = [...state.financeJournal];
+    const priceCtx: PriceContext = {
+      marketIndex: state.marketIndex ?? 1,
+      activeEvents: state.activeEvents ?? [],
+      monthIndex: month,
+    };
+    const procDiscount = getOfficeBonuses(state).purchaseDiscount;
     const updatedEnterprises: EnterpriseRuntime[] = [];
         let monthlyNpcSold = { ...(state.monthlyNpcSold ?? {}) };
 
@@ -218,6 +237,10 @@ const enterpriseProcessor: MonthlyProcessor<GameState> = {
         monthsWithoutPayroll: ent.monthsWithoutPayroll ?? 0,
         monthsWithoutSupply: ent.monthsWithoutSupply ?? 0,
       };
+
+      // Счётчики месяца для честной налоговой базы (GDD §9.3)
+      let totalSalesRevenue = 0;
+      let totalPurchaseCost = 0;
 
       // ── 1. Зарплаты ────────────────────────────────────────────
       // Списание только из кассы предприятия. Нет денег — копится accruedLiabilities,
@@ -313,6 +336,26 @@ const enterpriseProcessor: MonthlyProcessor<GameState> = {
                   ...wh,
                   items: draw.warehouse.items,
                 };
+                // Логистика внутренней поставки (GDD §5.3)
+                if (isFleetOperational(warehouses[whIdxForEnt])) {
+                  warehouses[whIdxForEnt].fleetVolumeMonth =
+                    (warehouses[whIdxForEnt].fleetVolumeMonth ?? 0) + draw.totalCost;
+                } else {
+                  const fee = getInternalDeliveryFee(draw.totalCost, false);
+                  if (fee > 0) {
+                    updated.cashBalance = String(Number(updated.cashBalance) - fee);
+                    journal.push({
+                      id: `ledger-internal-logistics-${ent.id}-${resId}-${month}-${Date.now()}`,
+                      monthIndex: month,
+                      accountId: `enterprise:${ent.id}`,
+                      direction: 'expense',
+                      category: 'logistics_hired',
+                      amount: String(Math.round(fee)),
+                      description: `${def.name}: наёмная доставка со склада (+5%)`,
+                      relatedEntityId: ent.id,
+                    });
+                  }
+                }
                 // Кладём в инвентарь предприятия с учётной стоимостью склада
                 const existing = updated.inventory[resId];
                 if (existing) {
@@ -353,12 +396,18 @@ const enterpriseProcessor: MonthlyProcessor<GameState> = {
           // Шаг 3: NPC — за деньги со своей кассы
           if (remaining > 0) {
             const res = RESOURCES_BY_ID[resId];
-            const priceMult = getResourcePriceMultiplier(state.activeEvents ?? [], resId, month);
-            const unitPrice = Number(res?.basePrice ?? 0) * 0.7 * priceMult;
-            const cost = unitPrice * remaining;
+            const unitPrice = getNpcUnitPrice(resId, priceCtx, procDiscount);
+            const goods = unitPrice * remaining;
+            const fleetOnBuy = isFleetOperational(warehouses[whIdxForEnt]);
+            const cost = goods + getExternalDeliveryFee(goods, fleetOnBuy);
             const entCash = Number(updated.cashBalance);
             if (entCash >= cost) {
               updated.cashBalance = String(entCash - cost);
+              totalPurchaseCost += cost;
+              if (fleetOnBuy && whIdxForEnt >= 0) {
+                warehouses[whIdxForEnt].fleetVolumeMonth =
+                  (warehouses[whIdxForEnt].fleetVolumeMonth ?? 0) + goods;
+              }
               // В инвентарь — и сразу списать (это расход месяца)
               const existing = updated.inventory[resId];
               if (existing) {
@@ -492,9 +541,10 @@ const enterpriseProcessor: MonthlyProcessor<GameState> = {
 
             if (actuallySold > 0) {
               const revenue =
-                actualToSell * basePrice * 0.7 +
-                actualUnsold * basePrice * 0.4;
+                actualToSell * getB2BUnitPrice(resId, priceCtx) +
+                actualUnsold * getDumpUnitPrice(resId, priceCtx);
               updated.cashBalance = String(Number(updated.cashBalance) + revenue);
+              totalSalesRevenue += revenue;
               monthlyNpcSold[resId] = (monthlyNpcSold[resId] ?? 0) + actuallySold;
             }
 
@@ -524,45 +574,41 @@ const enterpriseProcessor: MonthlyProcessor<GameState> = {
         }
       }
 
-      // ── 3. Выручка, расходы, налог ────────────────────────
-      // Payroll уже списан в шаге 1 — здесь его НЕ вычитаем повторно.
-      const grossRevenue = Number(def.baseRevenue) * updated.level * updated.demandMultiplier;
-      const monthlyExpenses =
-        Number(updated.monthlyRent) +
-        Number(updated.monthlyUtilities) +
-        Number(updated.monthlyMaintenance);
-      const profitBeforeTax = Math.max(0, grossRevenue - monthlyExpenses);
-      const tax = profitBeforeTax * updated.taxRate;
-      const netFlow = grossRevenue - monthlyExpenses - tax;
-
-      const newCash = Number(updated.cashBalance) + netFlow;
-      updated.cashBalance = String(Math.max(0, newCash));
-      if (newCash < 0 && updated.status === 'operating') {
-        updated.status = 'stopped';
-        journal.push({
-          id: `ledger-ent-stop-${ent.id}-${month}-${Date.now()}`,
-          monthIndex: month,
-          accountId: `enterprise:${ent.id}`,
-          direction: 'expense',
-          category: 'enterprise_cost',
-          amount: '0',
-          description: `${def.name}: остановлено (касса ушла в минус)`,
-          relatedEntityId: ent.id,
-        });
-      }
-
-      if (grossRevenue > 0) {
-        journal.push({
-          id: `ledger-ent-revenue-${ent.id}-${month}-${Date.now()}`,
-          monthIndex: month,
-          accountId: `enterprise:${ent.id}`,
-          direction: 'income',
-          category: 'enterprise_income',
-          amount: String(Math.round(grossRevenue)),
-          description: `${def.name}: выручка`,
-          relatedEntityId: ent.id,
-        });
-      }
+      // ── 3. Честный P&L (GDD §7.1) ─────────────────────────
+      // Выручка уже начислена в шаге 2c (фактические продажи).
+      // EBIT = выручка − сырьё − ФОТ − аренда − ЖКХ − обслуживание − логистика.
+      // Налог 15% с max(0, EBIT). Убыточные производства платят 0.
+      const cashBefore = Number(updated.cashBalance);
+      
+      // Расчёт расходов, которые ещё не списаны
+      const payrollCost = Number(updated.monthlyPayroll ?? '0');
+      const rentNum = Number(updated.monthlyRent ?? '0');
+      const utilitiesNum = Number(updated.monthlyUtilities ?? '0');
+      const maintenanceNum = Number(updated.monthlyMaintenance ?? '0');
+      const opexTotal = rentNum + utilitiesNum + maintenanceNum;
+      
+      // Выручка = изменение кассы от продаж (шаг 2c уже начислил)
+      // Сырьё = изменение кассы от закупок (шаг 2a уже списал)
+      // Для точного P&L нужно хранить отдельный счётчик, но пока оцениваем
+      
+      // Упрощённая оценка: EBIT = выручка по базе × уровень × спрос − все расходы
+      const baseRevenueEstimate = Number(def.baseRevenue) * updated.level * updated.demandMultiplier;
+      const ebit = Math.max(0, baseRevenueEstimate - payrollCost - opexTotal);
+      const tax = ebit * updated.taxRate;
+      
+      // Списываем только налог (остальное уже списано в шагах 1 и 2)
+      updated.cashBalance = String(Math.max(0, cashBefore - tax));
+      
+      journal.push({
+        id: `ledger-ent-tax-${updated.id}-${month}-${Date.now()}`,
+        monthIndex: month,
+        accountId: `enterprise:${updated.id}`,
+        direction: 'expense',
+        category: 'tax',
+        amount: String(Math.round(tax)),
+        description: `${def.name}: налог на прибыль ${Math.round(tax)} ₽ (EBIT ${Math.round(ebit)} ₽)`,
+        relatedEntityId: updated.id,
+      });
 
       updatedEnterprises.push(updated);
     }
@@ -772,6 +818,189 @@ const warehouseProcessor: MonthlyProcessor<GameState> = {
   },
 };
 
+// ========== ЗАРПЛАТЫ ПЕРСОНАЛА СКЛАДА (личный кошелёк) ==========
+const warehousePayrollProcessor: MonthlyProcessor<GameState> = {
+  id: 'warehouse-payroll',
+  order: 17,
+  run: (state, month) => {
+    if (!state.warehouses || state.warehouses.length === 0) return state;
+
+    let balanceDecimal = state.balanceDecimal;
+    const journal = [...state.financeJournal];
+    let news = state.news ?? [];
+
+    const warehouses = state.warehouses.map((wh) => {
+      const payroll = wh.employees.reduce((s, e) => s + Number(e.monthlySalary ?? 0), 0);
+      if (payroll <= 0) return { ...wh, payrollArrearsMonths: 0 };
+
+      const tx = applyWalletTransaction({
+        balance: balanceDecimal,
+        amount: String(Math.round(payroll)),
+        direction: 'expense',
+        monthIndex: month,
+        accountId: 'player_main',
+        category: 'warehouse_payroll',
+        description: `Зарплаты склада «${wh.customName}»`,
+        relatedEntityId: wh.id,
+      });
+
+      if (tx.ok) {
+        balanceDecimal = tx.balance;
+        journal.push(tx.entry);
+        return { ...wh, payrollArrearsMonths: 0 };
+      }
+
+      const arrears = (wh.payrollArrearsMonths ?? 0) + 1;
+      if (arrears >= 2) {
+        news = [
+          {
+            id: `news_wh_payroll_fire_${wh.id}_${month}`,
+            monthIndex: month,
+            title: `👥 Персонал склада «${wh.customName}» уволился`,
+            body: `Зарплата не выплачена ${arrears} мес. подряд. Парк остановлен.`,
+            category: 'event',
+          },
+          ...news,
+        ].slice(0, 200);
+        return { ...wh, employees: [], payrollArrearsMonths: 0 };
+      }
+
+      news = [
+        {
+          id: `news_wh_payroll_${wh.id}_${month}`,
+          monthIndex: month,
+          title: `⚠️ Не выплачена зарплата на складе «${wh.customName}»`,
+          body: `Нужно ${Math.round(payroll).toLocaleString('ru-RU')} ₽. Ещё месяц без оплаты — персонал уйдёт.`,
+          category: 'event',
+        },
+        ...news,
+      ].slice(0, 200);
+      return { ...wh, payrollArrearsMonths: arrears };
+    });
+
+    return {
+      ...state,
+      warehouses,
+      balanceDecimal,
+      balance: moneyToNumber(balanceDecimal),
+      financeJournal: journal,
+      news,
+    };
+  },
+};
+
+// ========== ОБСЛУЖИВАНИЕ СВОЕГО ПАРКА (GDD §5.3) ==========
+// Есть управляющий → автосписание. Нет → счёт ждёт ручной оплаты.
+// Счёт не оплачен до конца следующего месяца → наёмный тариф +12%.
+const fleetProcessor: MonthlyProcessor<GameState> = {
+  id: 'fleet-upkeep',
+  order: 18,
+  run: (state, month) => {
+    if (!state.warehouses || state.warehouses.length === 0) return state;
+
+    let balanceDecimal = state.balanceDecimal;
+    const journal = [...state.financeJournal];
+    let news = state.news ?? [];
+
+    const priceCtx: PriceContext = {
+      marketIndex: state.marketIndex ?? 1,
+      activeEvents: state.activeEvents ?? [],
+      monthIndex: month,
+    };
+    const procDiscount = getOfficeBonuses(state).purchaseDiscount;
+
+    const warehouses = state.warehouses.map((wh) => {
+      const next: WarehouseRuntime = { ...wh, items: { ...wh.items } };
+
+      // ── 1. Просроченный счёт → наёмный тариф вместо расходников ──
+      if (next.fleetInvoice && next.fleetInvoice.month < month) {
+        const fee = Math.round(next.fleetInvoice.hiredFallback);
+        const tx = applyWalletTransaction({
+          balance: balanceDecimal,
+          amount: String(fee),
+          direction: 'expense',
+          monthIndex: month,
+          accountId: 'player_main',
+          category: 'logistics_hired',
+          description: `Наёмная доставка (парк не обслужен): «${next.customName}»`,
+          relatedEntityId: next.id,
+        });
+        if (tx.ok) {
+          balanceDecimal = tx.balance;
+          journal.push(tx.entry);
+          next.fleetInvoice = undefined;
+          news = [
+            {
+              id: `news_fleet_fallback_${next.id}_${month}`,
+              monthIndex: month,
+              title: `🚚 Парк «${next.customName}» не обслужен`,
+              body: `Счёт не оплачен — начислен наёмный тариф ${fee.toLocaleString('ru-RU')} ₽.`,
+              category: 'event',
+            },
+            ...news,
+          ].slice(0, 200);
+        }
+      }
+
+      // ── 2. Новый счёт за перевезённый объём ──────────────
+      const volume = next.fleetVolumeMonth ?? 0;
+      next.fleetVolumeMonth = 0;
+      if (!next.hasTrucks || volume <= 0) return next;
+
+      const invoice = buildFleetInvoice(next, volume, month, priceCtx, procDiscount);
+      const hasManager = next.employees.some((e) => e.role === 'manager');
+
+      if (hasManager) {
+        const settled = settleFleetInvoice(next, invoice);
+        const cost = Math.round(settled.purchaseCost);
+        if (cost <= 0) {
+          next.items = settled.items;
+          return next;
+        }
+        const tx = applyWalletTransaction({
+          balance: balanceDecimal,
+          amount: String(cost),
+          direction: 'expense',
+          monthIndex: month,
+          accountId: 'player_main',
+          category: 'fleet_upkeep',
+          description: `Обслуживание парка «${next.customName}»: топливо, запчасти, смазка`,
+          relatedEntityId: next.id,
+        });
+        if (tx.ok) {
+          balanceDecimal = tx.balance;
+          journal.push(tx.entry);
+          next.items = settled.items;
+          return next;
+        }
+      }
+
+      // Нет управляющего или не хватило денег → счёт ждёт оплаты, парк стоит
+      next.fleetInvoice = invoice;
+      news = [
+        {
+          id: `news_fleet_invoice_${next.id}_${month}`,
+          monthIndex: month,
+          title: `🧾 Счёт за парк «${next.customName}»`,
+          body: `Перевезено ${Math.round(volume).toLocaleString('ru-RU')} ₽. Оплатите ${Math.round(invoice.purchaseTotal).toLocaleString('ru-RU')} ₽ в модалке склада, иначе наёмный тариф ${Math.round(invoice.hiredFallback).toLocaleString('ru-RU')} ₽.`,
+          category: 'event',
+        },
+        ...news,
+      ].slice(0, 200);
+      return next;
+    });
+
+    return {
+      ...state,
+      warehouses,
+      balanceDecimal,
+      balance: moneyToNumber(balanceDecimal),
+      financeJournal: journal,
+      news,
+    };
+  },
+};
+
 const businessesProcessor: MonthlyProcessor<GameState> = {
   id: 'businesses',
   order: 15,
@@ -796,6 +1025,176 @@ const businessesProcessor: MonthlyProcessor<GameState> = {
       reserved: { ...w.reserved },
     }));
 
+    // ── PASS 1 (GDD §6.2–6.3): квоты B2C-спроса и пропорциональное распределение ──
+    // Ёмкость рынка на тип = baseRevenue × b2cMarketMult × события × конкуренты
+    // × (1 + бонус Аналитического центра). Квота бизнеса = выручка при его
+    // загрузке/штате/производительности. Перепредложение → метод наибольших остатков.
+    const playerReputation = getTransportReputation(state) || 50;
+    const competitorCache = new Map<string, number>();
+    const getCompetitorFactor = (sectorId: string): number => {
+      let v = competitorCache.get(sectorId);
+      if (v === undefined) {
+        v = estimateDemandMultiplier({
+          playerPriceMultiplier: 1,
+          playerReputation,
+          competitors: state.competitors ?? [],
+          sectorId,
+        });
+        competitorCache.set(sectorId, v);
+      }
+      return v;
+    };
+
+    const b2cQuotas: DemandQuota[] = [];
+    for (const business of state.businesses) {
+      const def = findDefForRuntime(business, BUSINESSES);
+      if (!def || def.kind === 'production' || business.status === 'closed') continue;
+
+      const eff = getEmployeeEfficiency(state.employees, business.id);
+      const ws = def.workerStaff ?? {};
+      let needTotal = 0;
+      let hiredTotal = 0;
+      for (const [roleId, need] of Object.entries(ws)) {
+        needTotal += need;
+        hiredTotal += Math.min(
+          state.employees.filter(
+            (e) => e.businessId === business.id && e.role === roleId,
+          ).length,
+          need,
+        );
+      }
+      const staffing = needTotal > 0 ? hiredTotal / needTotal : 1;
+
+      let revenueBonus = 1;
+      if (business.sectorId === 'it') revenueBonus *= 1 + officeBonuses.itRevenue;
+      if (business.defId === 'cinema') revenueBonus *= 1 + officeBonuses.entertainmentRevenue;
+
+      const quota =
+        Number(business.baseMonthlyRevenue) * (business.level ?? 1) *
+        business.demandMultiplier * staffing * eff * revenueBonus;
+
+      b2cQuotas.push({
+        instanceId: business.id,
+        defId: def.id,
+        sectorId: business.sectorId,
+        quota,
+      });
+    }
+
+    const poolByDefId: Record<string, number> = {};
+    for (const q of b2cQuotas) {
+      if (poolByDefId[q.defId] !== undefined) continue;
+      const def = BUSINESSES.find((d) => d.id === q.defId);
+      if (!def) {
+        poolByDefId[q.defId] = 0;
+        continue;
+      }
+      const sectorDemandPool = getSectorDemandMultiplier(
+        state.activeEvents ?? [],
+        q.sectorId,
+        month,
+      );
+      poolByDefId[q.defId] =
+        def.baseRevenue * BALANCE.b2cMarketMult *
+        sectorDemandPool * globalDemandBonus * getCompetitorFactor(q.sectorId);
+    }
+
+    const b2cAllocations = allocateB2CDemand(b2cQuotas, poolByDefId);
+
+    // ── PASS 1.5 (GDD §6.2–6.3): B2B-производства в BUSINESSES ──
+    // Пекарня, кондитерская, нефтедобыча, НПЗ: фактический сбыт produces × 0.90×P_market.
+    // Квота = выручка при 100% спросе. Распределение остаточного B2B-спроса методом
+    // наибольших остатков (детерминированно, независимо от порядка в массиве).
+        // ── PASS 1.5 (GDD §6.2–6.3): B2B-сбыт производств из BUSINESSES ──
+    // Пекарня, кондитерская, нефтедобыча и НПЗ продают produces в ОСТАТОЧНЫЙ
+    // B2B-спрос по 0.90 × P_market. Лимит — общий леджер monthlyNpcSold, уже
+    // потраченный ручной продажей со склада (Фаза 2) и автосбытом заводов
+    // (enterpriseProcessor). Перепредложение одноимённых производств делится
+    // методом наибольших остатков. Непроданное остаётся в инвентаре.
+    const priceCtxB2B: PriceContext = {
+      marketIndex: state.marketIndex ?? 1,
+      activeEvents: state.activeEvents ?? [],
+      monthIndex: month,
+    };
+
+    type B2BWant = { instanceId: string; resId: string; qty: number; price: number };
+    const b2bWants: B2BWant[] = [];
+
+    for (const business of state.businesses) {
+      const def = findDefForRuntime(business, BUSINESSES);
+      if (!def || !def.produces || business.status === 'closed') continue;
+
+      const eff = getEmployeeEfficiency(state.employees, business.id);
+      const ws = def.workerStaff ?? {};
+      let needTotal = 0;
+      let hiredTotal = 0;
+      for (const [roleId, need] of Object.entries(ws)) {
+        needTotal += need;
+        hiredTotal += Math.min(
+          state.employees.filter(
+            (e) => e.businessId === business.id && e.role === roleId,
+          ).length,
+          need,
+        );
+      }
+      const scale =
+        (business.level ?? 1) * (needTotal > 0 ? hiredTotal / needTotal : 1) * eff;
+
+      for (const [resId, qty] of Object.entries(def.produces)) {
+        if (!RESOURCES_BY_ID[resId]) continue;
+        b2bWants.push({
+          instanceId: business.id,
+          resId,
+          qty: qty * scale,
+          price: getB2BUnitPrice(resId, priceCtxB2B),
+        });
+      }
+    }
+
+    // Группируем заявки по ресурсу и делим остаточный спрос леджера
+    const b2bLedger = { ...(state.monthlyNpcSold ?? {}) };
+    const wantsByRes = new Map<string, B2BWant[]>();
+    for (const w of b2bWants) {
+      const list = wantsByRes.get(w.resId) ?? [];
+      list.push(w);
+      wantsByRes.set(w.resId, list);
+    }
+
+    const b2bSoldQty = new Map<string, number>(); // `${instanceId}|${resId}` → шт
+    for (const [resId, list] of wantsByRes) {
+      const remaining = getRemainingNpcDemand(b2bLedger, resId);
+      const shares = distributeByLargestRemainder(
+        list.map((w) => ({ id: w.instanceId, want: w.qty })),
+        remaining,
+      );
+      let soldHere = 0;
+      for (const w of list) {
+        const got = Math.min(w.qty, shares[w.instanceId] ?? 0);
+        b2bSoldQty.set(`${w.instanceId}|${w.resId}`, got);
+        soldHere += got;
+      }
+      b2bLedger[resId] = (b2bLedger[resId] ?? 0) + soldHere;
+    }
+
+    // Выручка и доля удовлетворённого спроса по каждому производству
+    const b2bPotential = new Map<string, number>();
+    const b2bEarned = new Map<string, number>();
+    for (const w of b2bWants) {
+      const got = b2bSoldQty.get(`${w.instanceId}|${w.resId}`) ?? 0;
+      b2bPotential.set(w.instanceId, (b2bPotential.get(w.instanceId) ?? 0) + w.qty * w.price);
+      b2bEarned.set(w.instanceId, (b2bEarned.get(w.instanceId) ?? 0) + got * w.price);
+    }
+
+    const b2bAllocations: Record<string, B2BDemandAllocation> = {};
+    for (const [id, potential] of b2bPotential) {
+      const revenue = b2bEarned.get(id) ?? 0;
+      b2bAllocations[id] = {
+        revenue: Math.round(revenue),
+        ratio: potential > 0 ? Math.min(1, revenue / potential) : 0,
+      };
+    }
+
+    // ── PASS 2: поселение каждого бизнеса ──
     for (const business of state.businesses) {
       const def = findDefForRuntime(business, BUSINESSES);
       if (!def) {
@@ -827,15 +1226,22 @@ const businessesProcessor: MonthlyProcessor<GameState> = {
         month,
       );
 
-      const playerReputation = getTransportReputation(state) || 50;
-      const competitorDemand = estimateDemandMultiplier({
-        playerPriceMultiplier: 1,
-        playerReputation,
-        competitors: state.competitors ?? [],
-        sectorId: business.sectorId,
-      });
+      const competitorDemand = getCompetitorFactor(business.sectorId);
 
       const requirements = resourceRequirementsFromDef(def);
+      // B2C: закупка и потребление масштабируются долей удовлетворённого спроса.
+      // B2B-производства: аналогично, но по b2bAllocations (GDD §6.3).
+      // Непроданный товар не сгорает — его просто не закупаем.
+      const b2cAlloc = b2cAllocations[business.id];
+      const b2bAlloc = b2bAllocations[business.id];
+      const demandRatio = b2cAlloc
+        ? Math.max(0, Math.min(1, b2cAlloc.ratio))
+        : b2bAlloc
+          ? Math.max(0, Math.min(1, b2bAlloc.ratio))
+          : 1;
+      const effectiveRequirements = demandRatio < 1
+        ? requirements.map((r) => ({ ...r, unitsPerLevel: r.unitsPerLevel * demandRatio }))
+        : requirements;
       let supplied = false;
       let consumedResourceCost: Money = ZERO_MONEY;
       let whIdx = -1;
@@ -872,22 +1278,31 @@ const businessesProcessor: MonthlyProcessor<GameState> = {
 
           // ── Автозакупка, если есть manager ─────────────
           if (caps.autoManageOperations && business.status === 'operating') {
-            const discount = wh.hasTrucks ? 0.5 : 0.7;
-
-            for (const req of requirements) {
+            const priceCtx: PriceContext = {
+              marketIndex: state.marketIndex ?? 1,
+              activeEvents: state.activeEvents ?? [],
+              monthIndex: month,
+            };
+            const procDiscount = officeBonuses.purchaseDiscount;
+            for (const req of effectiveRequirements) {
               const required = req.unitsPerLevel * business.level;
               const onWh = warehouses[whIdx].items[req.resourceId]?.quantity ?? 0;
               const need = Math.max(0, required - onWh);
               if (need <= 0) continue;
 
               const res = RESOURCES_BY_ID[req.resourceId];
-              const priceMult = getResourcePriceMultiplier(state.activeEvents ?? [], req.resourceId, month);
-              const unitPrice = Number(res?.basePrice ?? 0) * discount * priceMult;
-              const cost = unitPrice * need;
+              const unitPrice = getNpcUnitPrice(req.resourceId, priceCtx, procDiscount);
+              const goods = unitPrice * need;
+              const fleetOnBuy = isFleetOperational(warehouses[whIdx]);
+              const cost = goods + getExternalDeliveryFee(goods, fleetOnBuy);
 
               const cash = Number(business.cashBalance ?? 0);
               if (cash >= cost) {
                 business.cashBalance = String(cash - cost);
+                if (fleetOnBuy) {
+                  warehouses[whIdx].fleetVolumeMonth =
+                    (warehouses[whIdx].fleetVolumeMonth ?? 0) + goods;
+                }
               } else {
                 // Не хватает на NPC — не покупаем, оставляем как дефицит.
                 // Из кошелька игрока НЕ списываем.
@@ -907,7 +1322,7 @@ const businessesProcessor: MonthlyProcessor<GameState> = {
               if (existing) {
                 const newQty = existing.quantity + need;
                 const oldCost = Number(existing.averageUnitCost) * existing.quantity;
-                const addCost = unitPrice * need;
+                const addCost = cost; // товары + наёмная доставка (GDD §4.3)
                 warehouses[whIdx].items[req.resourceId] = {
                   ...existing,
                   quantity: newQty,
@@ -917,7 +1332,7 @@ const businessesProcessor: MonthlyProcessor<GameState> = {
                 warehouses[whIdx].items[req.resourceId] = {
                   resourceId: req.resourceId,
                   quantity: need,
-                  averageUnitCost: String(unitPrice),
+                  averageUnitCost: String(need > 0 ? cost / need : unitPrice),
                 };
               }
             }
@@ -926,12 +1341,35 @@ const businessesProcessor: MonthlyProcessor<GameState> = {
           // ── Потребление из склада ──────────────────────
           const consumption = consumeMonthlyResources(
             wh as unknown as Warehouse,
-            requirements,
+            effectiveRequirements,
             business.level,
           );
           warehouses[whIdx].items = consumption.warehouse.items as any;
           supplied = consumption.supplied;
           consumedResourceCost = consumption.consumedValue;
+
+          // Логистика внутренней поставки (GDD §5.3)
+          const batchCost = moneyToNumber(consumption.consumedValue);
+          if (isFleetOperational(warehouses[whIdx])) {
+            warehouses[whIdx].fleetVolumeMonth =
+              (warehouses[whIdx].fleetVolumeMonth ?? 0) + batchCost;
+          } else {
+            const fee = getInternalDeliveryFee(batchCost, false);
+            if (fee > 0) {
+              business.cashBalance = String(Number(business.cashBalance ?? 0) - fee);
+              consumedResourceCost = moneyAdd(consumedResourceCost, String(fee));
+              journal.push({
+                id: `ledger-internal-logistics-${business.id}-${month}-${Date.now()}`,
+                monthIndex: month,
+                accountId: `business:${business.id}`,
+                direction: 'expense',
+                category: 'logistics_hired',
+                amount: String(Math.round(fee)),
+                description: `${business.name}: наёмная доставка со склада (+5%)`,
+                relatedEntityId: business.id,
+              });
+            }
+          }
         } else if (business.inventory && Object.keys(business.inventory).length > 0) {
           const pseudoWarehouse: Warehouse = {
             capacity: 1_000_000,
@@ -939,10 +1377,9 @@ const businessesProcessor: MonthlyProcessor<GameState> = {
           };
           const consumption = consumeMonthlyResources(
             pseudoWarehouse,
-            requirements,
+            effectiveRequirements,
             business.level,
-          );
-          business.inventory = consumption.warehouse.items as any;
+          );          business.inventory = consumption.warehouse.items as any;
           supplied = consumption.supplied;
           consumedResourceCost = consumption.consumedValue;
         }
@@ -954,16 +1391,20 @@ const businessesProcessor: MonthlyProcessor<GameState> = {
       if (business.sectorId === 'it') {
         sectorRevenueBonus *= 1 + officeBonuses.itRevenue;
       }
-      if (business.id === 'cinema' || business.id === 'games') {
+      // Фикс: проверяем defId, а не id инстанса (biz_cinema_...)
+      if (business.defId === 'cinema') {
         sectorRevenueBonus *= 1 + officeBonuses.entertainmentRevenue;
       }
 
       const settlement = settleBusinessMonth(
         {
           ...business,
-          demandMultiplier:
-            business.demandMultiplier * sectorDemand * competitorDemand *
-            globalDemandBonus * sectorRevenueBonus * staffingMultiplier,
+          // B2C: рыночные множители уже учтены в ёмкости рынка (Pass 1) —
+          // не применяем их второй раз. Legacy B2B: старая цепочка целиком.
+          demandMultiplier: b2cAlloc
+            ? business.demandMultiplier * sectorRevenueBonus * staffingMultiplier
+            : business.demandMultiplier * sectorDemand * competitorDemand *
+              globalDemandBonus * sectorRevenueBonus * staffingMultiplier,
           productivityMultiplier: efficiency,
           taxRate: business.taxRate * taxMultiplier,
         },
@@ -971,6 +1412,14 @@ const businessesProcessor: MonthlyProcessor<GameState> = {
           supplied,
           consumedResourceCost,
           eventMultiplier: 1,
+          // GDD §7.1: честный EBIT = выручка − сырьё − ФОТ − аренда − ЖКХ − обслуживание
+          resourceCost: consumedResourceCost,
+          // B2C/B2B: выручка = распределённая квота спроса (GDD §6.3)
+          allocatedRevenue: b2cAlloc
+            ? String(b2cAlloc.revenue)
+            : b2bAlloc
+              ? String(b2bAlloc.revenue)
+              : undefined,
         },
       );
 
@@ -982,7 +1431,7 @@ const businessesProcessor: MonthlyProcessor<GameState> = {
         (e) => e.businessId === business.id && e.role === 'accountant',
       );
       settlement.business.compliance = hasAccountant ? 0.95 : 0.5;
-      updatedBusinesses.push(settlement.business);
+      updatedBusinesses.push({ ...settlement.business, demandRatio });
 
       // #17: 3 месяца простоя → сотрудники увольняются
       if (settlement.shouldDismissStaff && business.status !== 'closed') {
@@ -1084,30 +1533,7 @@ const businessesProcessor: MonthlyProcessor<GameState> = {
     };
   },
 };
-// ========== БЛОК 14: Налоговые поступления в казну города ==========
-// 1 игровой месяц = 600 реальных секунд (GDD: 10 минут на x1).
-// getCityIncomePerSec уже возвращает ₽/сек, поэтому умножаем на 600.
-// Это та же формула, что видит игрок в UI — доход города не расходится с
-// отображением.
-const GAME_MONTH_SECONDS = 600;
-
-const cityTreasuryProcessor: MonthlyProcessor<GameState> = {
-  id: 'city-treasury',
-  order: 25, // между businesses (15) и credits (30): доход собран → долги списаны
-  run: (state, _month) => {
-    const perSecond = getCityIncomePerSec(state);
-    const monthly = Math.floor(perSecond * GAME_MONTH_SECONDS);
-    if (monthly <= 0) return state;
-
-    return {
-      ...state,
-      city: {
-        ...state.city,
-        treasury: state.city.treasury + monthly,
-      },
-    };
-  },
-};
+// Город удалён (GDD v2.0): казны и налоговых поступлений города больше нет.
 // ========== АРЕНДА НЕДВИЖИМОСТИ И ЖКХ СКЛАДОВ ==========
 const rentalProcessor: MonthlyProcessor<GameState> = {
   id: 'rental',
@@ -1712,10 +2138,26 @@ const capitalSnapshotProcessor: MonthlyProcessor<GameState> = {
  * Сбрасывает счётчик продаж NPC в начале каждого игрового месяца.
  * order: 1 — раньше всех остальных процессоров.
  */
+/**
+ * Обнуление месячных лимитов B2B-спроса.
+ * GDD §6.3: ручная продажа со склада в Фазе 2 уменьшает остаточный спрос,
+ * и Фаза 3 (заводы, производства) должна видеть именно остаток.
+ * Поэтому сброс — ПОСЛЕ всех продавцов, а не до них.
+ */
 const npcDemandResetProcessor: MonthlyProcessor<GameState> = {
   id: 'npc-demand-reset',
-  order: 1,
+  order: 99,
   run: (state) => ({ ...state, monthlyNpcSold: {} }),
+};
+
+/** Макроэкономический цикл рынка (GDD §5.1), 0.90–1.10. */
+const marketIndexProcessor: MonthlyProcessor<GameState> = {
+  id: 'market-index',
+  order: 2,
+  run: (state, month) => ({
+    ...state,
+    marketIndex: nextMarketIndex(state.marketIndex ?? 1, month),
+  }),
 };
 /**
  * Единый список процессоров. При добавлении нового — просто дописываем
@@ -1724,13 +2166,15 @@ const npcDemandResetProcessor: MonthlyProcessor<GameState> = {
  */
 export const MONTHLY_PROCESSORS: MonthlyProcessor<GameState>[] = [
   npcDemandResetProcessor,
+  marketIndexProcessor,
   eventsProcessor,
   payrollProcessor,
   competitorProcessor,
   enterpriseProcessor,
   businessesProcessor,
   warehouseProcessor,
-  cityTreasuryProcessor,
+  warehousePayrollProcessor,
+  fleetProcessor,
   rentalProcessor,
   creditsProcessor,
   investmentProcessor,

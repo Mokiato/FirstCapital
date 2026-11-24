@@ -2,6 +2,9 @@ import { useMemo, useState } from 'react';
 import { useGameStore } from '../game/store';
 import { RESOURCES, RESOURCES_BY_ID, type ResourceGroup } from '../data/resources';
 import { formatMoney, moneyToNumber } from '../game/domain/money';
+import { getNpcUnitPrice, getExternalDeliveryFee } from '../game/economy/pricing';
+import { getOfficeBonuses } from '../game/selectors';
+import { isFleetOperational } from '../game/logistics/fleet';
 
 type ShopTab = 'catalog' | 'warehouse';
 type GroupFilter = 'all' | ResourceGroup;
@@ -45,12 +48,33 @@ export default function ShopScreen() {
     .map(([id, qty]) => ({ resourceId: id, quantity: qty }));
 
   const selectedWh = state.warehouses.find((w) => w.id === targetWhId);
-  const discount = mode === 'wholesale' && selectedWh?.hasTrucks ? 0.5 : mode === 'wholesale' ? 0.7 : 1;
+  const hasOwnTransport = targetType === 'warehouse' && isFleetOperational(selectedWh);
+  // Почему парк не работает — объясняем игроку (GDD §1.2, принцип 3)
+  const fleetBlockedReason = !selectedWh
+    ? 'склад не выбран'
+    : !selectedWh.hasTrucks
+      ? 'нет грузовика'
+      : !selectedWh.employees.some((e) => e.role === 'driver')
+        ? 'нет водителя'
+        : selectedWh.fleetInvoice
+          ? 'счёт за парк не оплачен'
+          : null;
 
-  const totalCost = cartItems.reduce((sum, item) => {
-    const res = RESOURCES_BY_ID[item.resourceId];
-    return sum + Number(res?.basePrice ?? 0) * item.quantity * discount;
-  }, 0);
+  const priceCtx = {
+    marketIndex: state.marketIndex ?? 1,
+    activeEvents: state.activeEvents ?? [],
+    monthIndex: Math.floor(state.totalGameMonths),
+  };
+  const procDiscount = getOfficeBonuses(state).purchaseDiscount;
+  const unitPriceOf = (resourceId: string) =>
+    getNpcUnitPrice(resourceId, priceCtx, procDiscount);
+
+  const goodsCost = cartItems.reduce(
+    (sum, item) => sum + unitPriceOf(item.resourceId) * item.quantity,
+    0,
+  );
+  const deliveryFee = getExternalDeliveryFee(goodsCost, hasOwnTransport);
+  const totalCost = goodsCost + deliveryFee;
 
   const totalQty = cartItems.reduce((sum, item) => sum + item.quantity, 0);
 
@@ -176,7 +200,7 @@ export default function ShopScreen() {
                     >
                       <div className="col-span-5 font-bold text-[#332B2B] text-sm">{res.name}</div>
                       <div className="col-span-3 font-mono text-xs text-[#332B2B]">
-                        {formatMoney(res.basePrice)} <span className="text-[#776E64]">/ {res.unit}</span>
+                        {formatMoney(unitPriceOf(res.id).toFixed(0))} <span className="text-[#776E64]">/ {res.unit}</span>
                       </div>
                       <div className="col-span-2 font-mono text-xs text-[#776E64]">
                         {inCart > 0 ? <span className="text-[#8B5A3C] font-bold">{inCart}</span> : '—'}
@@ -262,7 +286,7 @@ export default function ShopScreen() {
                       <div className="flex-1">
                         <div className="text-[#332B2B]">{res?.name}</div>
                         <div className="text-[10px] text-[#776E64]">
-                          {item.quantity} × {formatMoney((Number(res?.basePrice) * discount).toFixed(0))}
+                          {item.quantity} × {formatMoney(unitPriceOf(item.resourceId).toFixed(0))}
                         </div>
                       </div>
                       <div className="flex items-center gap-1">
@@ -312,7 +336,7 @@ export default function ShopScreen() {
                           : 'bg-[#FBF9F4] text-[#776E64] border-[#D8D0C4]'
                       }`}
                     >
-                      ОПТ (−{discount === 1 ? '0' : Math.round((1 - discount) * 100)}%)
+                      ОПТ НА СКЛАД
                     </button>
                   </div>
                 </div>
@@ -357,7 +381,7 @@ export default function ShopScreen() {
                           const free = w.capacity - used - reserved;
                           return (
                             <option key={w.id} value={w.id}>
-                              {w.customName} {w.hasTrucks ? '🚚' : ''} (свободно {free})
+                              {w.customName} {isFleetOperational(w) ? '🚚' : w.hasTrucks ? '⚠' : ''} (свободно {free})
                             </option>
                           );
                         })}
@@ -390,6 +414,16 @@ export default function ShopScreen() {
                     <span className="text-[#776E64]">Всего единиц</span>
                     <span className="text-[#332B2B]">{totalQty}</span>
                   </div>
+                  <div className="flex justify-between font-mono text-xs mb-1">
+                    <span className="text-[#776E64]">Товары</span>
+                    <span className="text-[#332B2B]">{formatMoney(goodsCost.toFixed(0))}</span>
+                  </div>
+                  <div className="flex justify-between font-mono text-xs mb-1">
+                    <span className="text-[#776E64]">Доставка {hasOwnTransport ? '(свой парк)' : '+12%'}</span>
+                    <span className={hasOwnTransport ? 'text-[#4A7C59]' : 'text-[#332B2B]'}>
+                      {formatMoney(deliveryFee.toFixed(0))}
+                    </span>
+                  </div>
                   <div className="flex justify-between font-mono text-sm mt-2">
                     <span className="text-[#332B2B] font-bold">Итого</span>
                     <span className={`font-bold ${canAfford ? 'text-[#332B2B]' : 'text-[#A84A4A]'}`}>
@@ -410,9 +444,11 @@ export default function ShopScreen() {
                   {!canAfford ? 'НЕТ ДЕНЕГ' : 'ОФОРМИТЬ ЗАКАЗ'}
                 </button>
                 <div className="text-[10px] font-mono text-[#776E64] text-center">
-                  {mode === 'wholesale' && selectedWh?.hasTrucks
-                    ? 'Доставка мгновенная (грузовик)'
-                    : 'Доставка через 1 месяц'}
+                  {mode === 'wholesale' && isFleetOperational(selectedWh)
+                    ? 'Свой парк: наценка 0%, доставка мгновенная'
+                    : targetType === 'warehouse' && fleetBlockedReason
+                      ? `Наёмная доставка +12% (мин. 2 500 ₽) · парк: ${fleetBlockedReason}`
+                      : 'Наёмная доставка +12% (мин. 2 500 ₽), через 1 месяц'}
                 </div>
               </div>
             )}

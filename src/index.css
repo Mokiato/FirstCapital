@@ -56,3 +56,17 @@ html, body, #root {
   font-weight: 500;
   color: #332B2B;
 }
+/* Чек с зубчатым нижним краем */
+.receipt-zigzag::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -8px;
+  height: 8px;
+  background:
+    linear-gradient(-45deg, #d6d2c4 4px, transparent 0),
+    linear-gradient(45deg, #d6d2c4 4px, transparent 0);
+  background-size: 8px 8px;
+  background-repeat: repeat-x;
+}

@@ -2,7 +2,7 @@ import type { Money } from './types';
 
 export type WarehouseSize = 'small' | 'medium' | 'large' | 'huge';
 
-export type WarehouseRole = 'manager' | 'hr' | 'accountant' | 'storekeeper' | 'loader';
+export type WarehouseRole = 'manager' | 'hr' | 'accountant' | 'storekeeper' | 'loader' | 'driver';
 
 export interface WarehouseEmployee {
   id: string;
@@ -29,6 +29,31 @@ export interface WarehouseEvent {
   resolved: boolean;
 }
 
+/** Строка счёта за обслуживание своего парка (GDD §5.3). */
+export interface FleetInvoiceLine {
+  resourceId: string;
+  /** Требуется всего (дробно). */
+  required: number;
+  /** Берём со склада бесплатно. */
+  fromStock: number;
+  /** Докупаем у NPC по 1.00 × P_market. */
+  toBuy: number;
+  unitPrice: number;
+  purchaseCost: number;
+}
+
+export interface FleetInvoice {
+  /** Месяц, за который выставлен счёт. */
+  month: number;
+  /** Перевезённый объём, ₽ по учётной себестоимости. */
+  volume: number;
+  lines: FleetInvoiceLine[];
+  /** Итого докупка у NPC (со склада — 0 ₽). */
+  purchaseTotal: number;
+  /** Наёмный тариф, начисляемый при неоплате. */
+  hiredFallback: number;
+}
+
 export interface WarehouseRuntime {
   id: string;
   customName: string;
@@ -45,6 +70,12 @@ export interface WarehouseRuntime {
   reserved: Record<string, number>; // businessId -> quantity
   /** Месяц, когда склад был куплен (для условия «старше 6 мес»). */
   createdAtMonth?: number;
+  /** Перевезённый объём за текущий месяц (₽ по учёту), обнуляется при закрытии. */
+  fleetVolumeMonth?: number;
+  /** Неоплаченный счёт за обслуживание парка → парк не работает. */
+  fleetInvoice?: FleetInvoice;
+  /** Месяцев подряд без выплаты зарплат персоналу склада. */
+  payrollArrearsMonths?: number;
 }
 
 // ─── Аренда недвижимости ─────────────────────────────────

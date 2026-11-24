@@ -82,36 +82,10 @@ export interface CollectionSetDef {
   fullSetBonusText: string;
 }
 
-export type CityBuildingCategory = 'residential' | 'infrastructure' | 'industrial' | 'decor' | 'space';
-
-export interface CityBuildingDef {
-  id: string;
-  name: string;
-  category: CityBuildingCategory;
-  price: number;
-  population: number;
-  happiness: number;
-  energy: number;
-  water: number;
-  emoji: string;
-}
-
 export interface OwnedBusiness {
   id: string;
   level: number;
   stars: number;
-}
-
-export interface CityState {
-  name: string;
-  population: number;
-  happiness: number;
-  taxRate: number;
-  treasury: number;
-  buildings: Record<string, number>;
-  research: string[];
-  /** Разрешение на строительство куплено → открывает режим города. */
-  constructionPermit: boolean;
 }
 
 export interface Quest {
@@ -178,13 +152,3 @@ export interface StockDef {
   emoji: string;
 }
 
-// ========== HOLIDAYS ==========
-export interface HolidayDef {
-  id: string;
-  name: string;
-  emoji: string;
-  description: string;
-  multiplier: number;
-  start: { month: number; day: number };
-  end: { month: number; day: number };
-}

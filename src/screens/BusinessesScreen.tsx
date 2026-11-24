@@ -397,7 +397,6 @@ export default function BusinessesScreen() {
       )}
 
       <OpenBusinessModal defId={openDefId} onClose={() => setOpenDefId(null)} />
-      <OpenBusinessModal defId={openDefId} onClose={() => setOpenDefId(null)} />
       <ManageBusinessRuntimeModal instanceId={manageInstanceId} onClose={() => setManageInstanceId(null)} />
       <WarehouseModal warehouseId={warehouseModalId} onClose={() => setWarehouseModalId(null)} />
       <OpenProductionModal
@@ -412,8 +411,5 @@ export default function BusinessesScreen() {
         enterpriseId={manageEnterpriseId}
         onClose={() => setManageEnterpriseId(null)}
       />
-      <OpenBusinessModal defId={openDefId} onClose={() => setOpenDefId(null)} />
-      <ManageBusinessRuntimeModal instanceId={manageInstanceId} onClose={() => setManageInstanceId(null)} />
-    </div>
-  );
+    </div>  );
 }

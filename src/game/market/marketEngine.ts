@@ -10,17 +10,20 @@ import {
 } from '../domain/money';
 
 const MIN_SHARE_PRICE = '0.01';
-const GAME_MINUTES_PER_MONTH = 10;
+// GDD v2.0 §3.1: 1 тик = 1 месяц, 12 тиков в год. Суб-тики удалены.
 const GAME_MONTHS_PER_YEAR = 12;
 
+// Волатильность за ОДИН МЕСЯЧНЫЙ тик. Старые значения были рассчитаны
+// на 120 тиков/год; пересчитаны ×√10, чтобы годовая волатильность
+// сохранилась при переходе на 12 тиков/год.
 const VOLATILITY_BY_PROFILE: Record<
   MarketCompany['volatility'],
   number
 > = {
-  stable: 0.001,
-  moderate: 0.004,
-  volatile: 0.012,
-  speculative: 0.035,
+  stable: 0.003,
+  moderate: 0.013,
+  volatile: 0.038,
+  speculative: 0.11,
 };
 
 export interface MarketTickOptions {
@@ -47,8 +50,7 @@ export function tickMarket(
       Math.min(5, company.annualGrowth),
     );
 
-    const ticksPerYear =
-      GAME_MONTHS_PER_YEAR * GAME_MINUTES_PER_MONTH;
+    const ticksPerYear = GAME_MONTHS_PER_YEAR;
 
     const baseDrift =
       Math.pow(1 + annualGrowth, 1 / ticksPerYear) - 1;

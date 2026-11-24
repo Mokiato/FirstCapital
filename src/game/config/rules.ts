@@ -12,7 +12,7 @@ export const RULES = {
   /** 1 месяц = 10 реальных минут при x1 */
   monthRealMsAtX1: 10 * 60 * 1000,
   /** Рыночный тик = 1 игровая минута = 0.1 месяца */
-  marketTicksPerMonth: 10,
+  marketTicksPerMonth: 1,
 
   /** Работа раз в игровой месяц */
   workCooldownMonths: 1,

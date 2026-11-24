@@ -1,13 +1,27 @@
 import { create } from 'zustand';
 import { toast } from 'sonner';
-import type { CityState, Quest } from '../types';
+import type { Quest } from '../types';
 import { CAREERS_BY_ID } from '../data/careers';
 import { useClockStore } from './simulation/clockStore';
+import { getMonthLabel } from './simulation/clock';
 import { tickMarket } from './market/marketEngine';
-import { getCompanyPriceMultiplier, getResourcePriceMultiplier } from './events/eventEngine';
+import { getCompanyPriceMultiplier } from './events/eventEngine';
+import {
+  getNpcUnitPrice,
+  getB2BUnitPrice,
+  getDumpUnitPrice,
+  getExternalDeliveryFee,
+  type PriceContext,
+} from './economy/pricing';
+import { isFleetOperational, settleFleetInvoice } from './logistics/fleet';
+import {
+  buildCapexPlan,
+  getCapexPackage,
+  getCapexDiscount,
+  consumeCapexFromWarehouses,
+} from './economy/capex';
 import { REAL_ESTATE } from '../data/realEstate';
 import { TRANSPORT } from '../data/transport';
-import { CITY_BUILDINGS } from '../data/cityBuildings';
 import { runMonthlyProcessors } from './simulation/processors';
 import { calculateCapital } from './economy/capital';
 import { buildMarketCompanies } from './market/build';
@@ -18,7 +32,7 @@ import { OFFICE_COMPANIES_BY_ID } from '../data/officeCompanies';
 import { buyShares, sellShares, type TradePolicy } from './market/trading';
 import { getOfficeBonuses } from './selectors';
 import { TAXES } from './config/taxes';
-import { EMPLOYEE_ROLES_BY_ID, isManagementRole } from '../data/employees';
+import { EMPLOYEE_ROLES_BY_ID, isManagementRole, computeWorkerSalaries } from '../data/employees';
 import { getRemainingNpcDemand } from './economy/npcDemand';
 import type {
   WarehouseRuntime, WarehouseEmployee, WarehouseRole, RentalOffer, RentedProperty,
@@ -70,7 +84,6 @@ import {
   type SelectorState,
 } from './selectors';
 import type { CompetitorRuntime, CareerProgress } from './domain/types';
-import { RESEARCH_TREE } from '../data/cityBuildings';
 import { ACHIEVEMENTS, pickDailyQuests, QUEST_POOL } from './questsAndAchievements';
 import { saveToStorage } from './persistence/save';
 import { browserStorage } from './persistence/browserStorage';
@@ -107,9 +120,7 @@ export interface GameState extends SelectorState {
   lifetimeUpgrades: number;
   savingsBalance: Money; // Накопительный счёт
   fixedDeposits: FixedDeposit[]; // До 10 штук
-  lastDealTimestamp: number;
   registeredAt: number;
-  city: CityState;
   quests: Quest[];
   questsDate: string;
   achievementsClaimed: string[];
@@ -118,7 +129,6 @@ export interface GameState extends SelectorState {
   // TODO(Блок 1): удалить оффлайн-доход. ТЗ запрещает оффлайн-прогресс.
   // Рефакторинг store, удаление полей и связанного UI — Блок 1.
   favoriteBusinesses: string[];
-  forcedHoliday: string | null;
 
   // ========== НОВОЕ (Блок 3: Статистика) ==========
   /** Снимки капитала по завершённым игровым месяцам. Хранится до 120 месяцев. */
@@ -148,8 +158,11 @@ export interface GameState extends SelectorState {
   employees: EmployeeRuntime[];
     /** Игра окончена (банкротство после ликвидации активов). */
   gameOver: boolean;
-    /** Сколько единиц каждого ресурса NPC купил в текущем игровом месяце. */
+  /** Сколько единиц каждого ресурса NPC купил в текущем игровом месяце. */
   monthlyNpcSold: Record<string, number>;
+
+  /** Макроэкономический индекс рынка 0.90–1.10 (GDD §5.1). */
+  marketIndex: number;
 
   /** Нанять сотрудника на бизнес. Возвращает { ok, reason }. */
   hireEmployee: (businessId: string, role: EmployeeRole) => { ok: boolean; reason?: string };
@@ -160,8 +173,11 @@ export interface GameState extends SelectorState {
   buyWarehouseTruck: (warehouseId: string) => { ok: boolean; reason?: string };
     /** Устранить событие на складе (заплатить стоимость ремонта). */
   resolveWarehouseEvent: (warehouseId: string) => { ok: boolean; reason?: string };
-  /** Продать ресурс со склада NPC-покупателю (basePrice × 0.4). */
+  /** Продать ресурс со склада: B2B 0.90× в пределах спроса, слив 0.45× сверх. */
   sellResourceFromWarehouse: (warehouseId: string, resourceId: string, quantity: number) => { ok: boolean; reason?: string; total?: string };
+
+  /** Оплатить счёт за обслуживание своего парка (расходники fuel/parts/lubricants). */
+  payFleetInvoice: (warehouseId: string) => { ok: boolean; reason?: string };
     // ========== ПРОИЗВОДСТВА И ОФИСНЫЕ КОМПАНИИ ==========
   /** Открыть производство в купленном промпомещении. */
   openProduction: (premisesId: string, productionId: string) => { ok: boolean; reason?: string };
@@ -242,15 +258,17 @@ export interface GameState extends SelectorState {
   /** Захватить снимок текущего капитала за текущий игровой месяц. */
   captureCapitalSnapshot: () => void;
   
-  // ========== НОВОЕ (Блок 1: Игровое время) ==========
+  // ========== Игровое время (GDD v2.0 §3.1: 1 ход = 1 месяц) ==========
   onCompletedMonths: (completedMonths: number[]) => void;
 
-  /** Тик рыночных цен по игровому времени (масштабируется скоростью). */
-  tickMarketPrices: () => void;
-    // ========== НОВОЕ (Блок 9: Новый рынок акций) ==========
+  /** Завершить текущий месяц: Фаза 3 (закрытие) → Фаза 1 (новый месяц, рынок). */
+  endTurn: () => void;
+
+  /** Месячная переоценка акций. Один вызов на ход (из endTurn). */
+  tickMarketPrices: () => void;    // ========== НОВОЕ (Блок 9: Новый рынок акций) ==========
   /** Полноценный рынок 80 компаний (MarketCompany из domain). */
   marketCompanies: MarketCompany[];
-  /** Индекс последнего рыночного тика (в единицах 10 000 game-ms). */
+  /** Индекс последнего месячного тика рынка (== totalGameMonths на момент тика). */
   lastMarketTickIndex: number;    // ========== НОВОЕ (Блок 10: Конкуренты и рейтинг) ==========
   /** Активные NPC-конкуренты (не более 20). */
   competitors: CompetitorRuntime[];
@@ -332,17 +350,10 @@ export interface GameState extends SelectorState {
   // TODO(Блок 1): удалить бустеры. ТЗ запрещает бустеры в игре.
   // Рефакторинг store, удаление полей и связанного UI — Блок 1.
 
-  // actions
-  tick: (deltaSeconds: number) => void;
-  // TODO(Блок 1): удалить оффлайн-доход. ТЗ запрещает оффлайн-прогресс.
+  // actions  // TODO(Блок 1): удалить оффлайн-доход. ТЗ запрещает оффлайн-прогресс.
   // Рефакторинг store, удаление полей и связанного UI — Блок 1.
   buyProperty: (id: string) => void;
   buyTransport: (id: string) => void;
-    /** Купить разрешение на строительство города за основную валюту. */
-  buyConstructionPermit: () => { ok: boolean; reason?: string };
-  buyCityBuilding: (id: string) => void;
-  buyResearch: (id: string) => void;
-  setCityTaxRate: (rate: number) => void;
   claimQuest: (id: string) => void;
   claimAchievement: (id: string) => void;
   setCompanyName: (name: string) => void;
@@ -372,7 +383,6 @@ rest: () => { ok: boolean; reason?: string };
 
   // DevTools actions
   addBalance: (amount: number) => void;
-  setForcedHoliday: (holiday: string | null) => void;
   hardReset: () => void;
     /** Записать доход/расход игрока. Обновляет balanceDecimal, balance и журнал. */
   recordTransaction: (input: {
@@ -404,16 +414,6 @@ rest: () => { ok: boolean; reason?: string };
   loadGame: (saveData: any) => void;
 }
 
-const initialCity: CityState = {
-  name: 'Новоград',
-  population: 0,
-  happiness: 50,
-  taxRate: 15,
-  treasury: 0,
-  buildings: {},
-  research: [],
-  constructionPermit: false,
-};
 const TRADE_POLICY: TradePolicy = {
   commissionRate: TAXES.brokerFee,
   capitalGainsTaxRate: TAXES.realizedStockProfit,
@@ -434,11 +434,9 @@ export const useGameStore = create<GameState>()((set, get) => ({
   totalEarned: 0,
   lifetimeGames: 0,
   lifetimeUpgrades: 0,
-  lastDealTimestamp: 0,
   registeredAt: Date.now(),
   ownedProperty: [],
   ownedTransport: [],
-  city: initialCity,
   quests: pickDailyQuests(Date.now()),
   questsDate: todayKey(),
   achievementsClaimed: [],
@@ -452,7 +450,6 @@ export const useGameStore = create<GameState>()((set, get) => ({
   energy: 100,
   lastRestMonth: -1,
   personalInventory: {},
-  forcedHoliday: null,
   capitalSnapshots: [],
   businesses: [],
   warehouses: [],
@@ -483,6 +480,7 @@ export const useGameStore = create<GameState>()((set, get) => ({
   fixedDeposits: [],
   gameOver: false,
   monthlyNpcSold: {},
+  marketIndex: 1,
 
   pushNotification: (text) =>
     set((s) => ({
@@ -506,40 +504,48 @@ onCompletedMonths: (completedMonths) => {
 
   get().captureCapitalSnapshot();
 },
-  // ========== БЛОК 9: Рыночный тик по игровому времени ==========
-  // 60 тиков за игровой месяц = 10 реальных секунд на x1 (GDD).
-  // На x3/x6 тики ускоряются пропорционально — рынок движется равномерно.
+  // ========== ХОД ИГРОКА (GDD v2.0 §3.1–3.3) ==========
+  // Кнопка «Завершить месяц»: Фаза 3 — закрытие месяца через процессоры,
+  // затем Фаза 1 — новый месяц: месячная переоценка акций, автосохранение.
+  endTurn: () => {
+    const s = get();
+    if (s.gameOver) return;
+
+    const closedMonth = useClockStore.getState().nextMonth();
+    get().onCompletedMonths([closedMonth]);
+    get().tickMarketPrices();
+    get().saveGame();
+
+    toast.success(getMonthLabel(closedMonth), {
+      description: 'Месяц закрыт. Отчёты и рынок обновлены.',
+    });
+  },
+
+  // ========== БЛОК 9: Месячный тик рынка (12 тиков/год, GDD §3.1) ==========
   tickMarketPrices: () => {
     const s = get();
-    const clock = useClockStore.getState().clock;
+    const monthIndex = s.totalGameMonths;
 
-    const GAME_MONTH_MS = 600_000;
-    const TICK_GAME_MS = 10_000;
+    // Не более одного тика на игровой месяц.
+    if (monthIndex <= s.lastMarketTickIndex) return;
 
-    const totalGameMs = clock.monthIndex * GAME_MONTH_MS + clock.monthProgressMs;
-    const dueTick = Math.floor(totalGameMs / TICK_GAME_MS);
-
-    // Один тик за вызов — плавно и без визуальных рывков при догоне.
-    if (dueTick <= s.lastMarketTickIndex) return;
-
-    const nextTickIndex = s.lastMarketTickIndex + 1;
     const companySignals: Record<string, number> = {};
     for (const c of s.marketCompanies) {
-      const mult = getCompanyPriceMultiplier(s.activeEvents, c.id, clock.monthIndex);
+      const mult = getCompanyPriceMultiplier(s.activeEvents, c.id, monthIndex);
       if (mult !== 1) companySignals[c.id] = mult - 1;
     }
 
     const nextCompanies = tickMarket(s.marketCompanies, {
-      minuteIndex: nextTickIndex,
-      monthIndex: clock.monthIndex,
+      minuteIndex: monthIndex,
+      monthIndex,
       companySignals,
     });
     set({
       marketCompanies: nextCompanies,
-      lastMarketTickIndex: nextTickIndex,
+      lastMarketTickIndex: monthIndex,
+      marketTickMinuteIndex: monthIndex,
     });
-  },
-  // ========== БЛОК 1: Загрузка сохранения ==========
+  },  // ========== БЛОК 1: Загрузка сохранения ==========
   getSavePayload: () => {
     const s = get();
     const payload: Record<string, unknown> = {};
@@ -1131,40 +1137,56 @@ const deposit: FixedDeposit = {
     const firstMonthRent = premisesMode === 'rent' ? def.fixedCosts * 0.7 : 0;
     const firstMonthUtilities = def.fixedCosts * 0.3;
 
-    // ── Разовое оборудование (по опт-цене ×0.7) ──────────────
+    const priceCtx: PriceContext = {
+      marketIndex: s.marketIndex ?? 1,
+      activeEvents: s.activeEvents ?? [],
+      monthIndex: Math.floor(s.totalGameMonths),
+    };
+    const procDiscount = getOfficeBonuses(s).purchaseDiscount;
+
+    // ── Разовое оборудование по каналу 1 (1.00 × P_market) ──────────────
     let requiredEquipmentCost = 0;
-    if (def.requiredEquipment) {
-      for (const [resId, qty] of Object.entries(def.requiredEquipment)) {
-        const res = RESOURCES_BY_ID[resId];
-        if (!res) continue;
-        requiredEquipmentCost += Number(res.basePrice) * qty * 0.7;
-      }
+    for (const [resId, qty] of Object.entries(def.requiredEquipment ?? {})) {
+      requiredEquipmentCost += getNpcUnitPrice(resId, priceCtx, procDiscount) * qty;
     }
 
-    // ── Стартовые ресурсы: keyResources × 1 месяц по опт-цене (×0.7) ──
+    // ── Стартовые ресурсы: keyResources × 1 месяц по 1.00 × P_market ──
     let initialResourcesCost = 0;
     const initialInventory: Record<string, { quantity: number; averageUnitCost: Money }> = {};
     for (const [resId, qty] of Object.entries(def.keyResources)) {
-      const res = RESOURCES_BY_ID[resId];
-      if (!res) continue;
-      const unitCost = Number(res.basePrice) * 0.7;
+      const unitCost = getNpcUnitPrice(resId, priceCtx, procDiscount);
       initialResourcesCost += unitCost * qty;
-      initialInventory[resId] = {
-        quantity: qty,
-        averageUnitCost: String(unitCost),
-      };
+      initialInventory[resId] = { quantity: qty, averageUnitCost: String(unitCost) };
     }
+
+    // ── CAPEX-пакет строительства (GDD §7.3) ──
+    const capexPlan = buildCapexPlan(
+      getCapexPackage(def.id, premisesMode === 'owned'),
+      s.warehouses,
+      priceCtx,
+      {
+        procurementDiscount: procDiscount,
+        capexDiscount: getCapexDiscount({
+          hasConstructionCo: s.businesses.some(
+            (b) => b.defId === 'construction_co' && b.status === 'operating',
+          ),
+          hasProjectBureau: s.enterprises.some(
+            (e) => e.defId === 'off_project_bureau' && e.status === 'operating',
+          ),
+        }),
+      },
+    );
 
     // Бонус проектного бюро — только для строительных бизнесов
     const officeBonuses = getOfficeBonuses(s);
     const isConstruction = def.id === 'construction_co';
     const constructionMult = isConstruction ? (1 - officeBonuses.constructionDiscount) : 1;
 
-    const total = Math.round(
-      (equipment + premises + firstMonthRent + firstMonthUtilities +
-        requiredEquipmentCost + initialResourcesCost + operatingCapital) * constructionMult,
-    );
-
+    const total =
+      Math.round(
+        (equipment + premises + firstMonthRent + firstMonthUtilities +
+          requiredEquipmentCost + initialResourcesCost + operatingCapital) * constructionMult,
+      ) + capexPlan.marketTotal;
     if (moneyToNumber(s.balanceDecimal) < total) {
       return {
         ok: false,
@@ -1188,9 +1210,14 @@ const deposit: FixedDeposit = {
 
     set({
       businesses: [...s.businesses, runtime],
+      warehouses: consumeCapexFromWarehouses(s.warehouses, capexPlan),
     });
 
-    toast.success(`Открыт бизнес: «${def.name}»`);
+    toast.success(`Открыт бизнес: «${def.name}»`, {
+      description: capexPlan.warehouseUnits > 0
+        ? `CAPEX: со склада ${capexPlan.warehouseUnits} ед. + рынок ${formatMoney(String(capexPlan.marketTotal))}`
+        : `CAPEX-пакет: ${formatMoney(String(capexPlan.marketTotal))}`,
+    });
     return { ok: true };
   },
 
@@ -1335,10 +1362,13 @@ const deposit: FixedDeposit = {
     }
 
     // ── Зарплата ─────────────────────────────────
-    // HR всегда получает минималка −10%
-    const salary = role === 'hr'
-      ? Math.round(def.salaryMin * 0.9)
-      : Math.round(def.salaryMin + Math.random() * (def.salaryMax - def.salaryMin));
+    // Рабочие: доля каталожного ФОТ (GDD §9.1). Управленцы: вилка + сверх ФОТ.
+    const workerSalaries = computeWorkerSalaries(businessDef?.payroll ?? 0, workerStaff);
+    const salary = !isMgmt && workerSalaries[role]
+      ? workerSalaries[role]
+      : role === 'hr'
+        ? Math.round(def.salaryMin * 0.9)
+        : Math.round(def.salaryMin + Math.random() * (def.salaryMax - def.salaryMin));
 
     const months = Math.round(
       def.contractMinMonths +
@@ -1372,15 +1402,13 @@ const deposit: FixedDeposit = {
 
     // ── HR: автозаполнение всех вакансий ─────────
     if (role === 'hr') {
-      const toHire: Array<{ role: EmployeeRole; count: number }> = [
-        { role: 'manager', count: 1 },
-        { role: 'accountant', count: 1 },
-        ...Object.entries(workerStaff).map(([r, c]) => ({
+      // GDD §9.2: штатный HR закрывает рабочие вакансии.
+      // Управляющий и бухгалтер — осознанный найм игроком сверх базового ФОТ.
+      const toHire: Array<{ role: EmployeeRole; count: number }> =
+        Object.entries(workerStaff).map(([r, c]) => ({
           role: r as EmployeeRole,
           count: c,
-        })),
-      ];
-
+        }));
       for (const item of toHire) {
         const currentCount = nextEmployees.filter(
           (e) => e.businessId === businessId && e.role === item.role,
@@ -1392,8 +1420,7 @@ const deposit: FixedDeposit = {
         if (!roleDef) continue;
 
         for (let i = 0; i < needed; i++) {
-          // HR нанимает по минималке −10%
-          const newSalary = Math.round(roleDef.salaryMin * 0.9);
+          const newSalary = workerSalaries[item.role] ?? Math.round(roleDef.salaryMin * 0.9);
           const newMonths = Math.round(
             roleDef.contractMinMonths +
               Math.random() * (roleDef.contractMaxMonths - roleDef.contractMinMonths),
@@ -1462,25 +1489,27 @@ const deposit: FixedDeposit = {
     const res = RESOURCES_BY_ID[resourceId];
     if (!res) return { ok: false, reason: 'Ресурс не найден' };
 
-    // ── Проверка лимита NPC ─────────────────────────
+    // ── Канал 3 (B2B 0.90×) в пределах спроса + канал 5 (слив 0.45×) сверх ──
+    const priceCtx: PriceContext = {
+      marketIndex: s.marketIndex ?? 1,
+      activeEvents: s.activeEvents ?? [],
+      monthIndex: Math.floor(s.totalGameMonths),
+    };
     const remaining = getRemainingNpcDemand(s.monthlyNpcSold, resourceId);
-    if (remaining <= 0) {
-      return {
-        ok: false,
-        reason: `Спрос NPC на «${res.name}» исчерпан в этом месяце`,
-      };
-    }
-    const soldQty = Math.min(quantity, remaining);
+    const b2bQty = Math.min(quantity, remaining);
+    const dumpQty = quantity - b2bQty;
+    const soldQty = quantity;
 
-    const unitPrice = res.basePrice * 0.4;
-    const total = unitPrice * soldQty;
+    const total =
+      getB2BUnitPrice(resourceId, priceCtx) * b2bQty +
+      getDumpUnitPrice(resourceId, priceCtx) * dumpQty;
 
     const tx = s.recordTransaction({
       direction: 'income',
       amount: total,
       category: 'warehouse_sale',
-      description: `Продажа NPC: ${soldQty} ${res.unit} ${res.name}${
-        soldQty < quantity ? ` (лимит: запрошено ${quantity})` : ''
+      description: `Продажа: ${b2bQty} ${res.unit} ${res.name} по B2B${
+        dumpQty > 0 ? ` + ${dumpQty} слив сверх спроса` : ''
       }`,
       relatedEntityId: warehouseId,
     });
@@ -1500,7 +1529,7 @@ const deposit: FixedDeposit = {
       }),
       monthlyNpcSold: {
         ...st.monthlyNpcSold,
-        [resourceId]: (st.monthlyNpcSold[resourceId] ?? 0) + soldQty,
+        [resourceId]: (st.monthlyNpcSold[resourceId] ?? 0) + b2bQty,
       },
     }));
 
@@ -1512,12 +1541,12 @@ const deposit: FixedDeposit = {
     const wh = s.warehouses.find((w) => w.id === warehouseId);
     if (!wh) return { ok: false, reason: 'Склад не найден' };
 
-    // Лимиты по размеру склада
+    // Лимиты по размеру склада. Водитель — 1 на грузовик (GDD §5.3).
     const limits = {
-      small:  { storekeeper: 1, loader: 1, manager: 1, hr: 1, accountant: 1 },
-      medium: { storekeeper: 2, loader: 2, manager: 1, hr: 1, accountant: 1 },
-      large:  { storekeeper: 3, loader: 3, manager: 1, hr: 1, accountant: 1 },
-      huge:   { storekeeper: 3, loader: 5, manager: 1, hr: 1, accountant: 1 },
+      small:  { storekeeper: 1, loader: 1, manager: 1, hr: 1, accountant: 1, driver: 1 },
+      medium: { storekeeper: 2, loader: 2, manager: 1, hr: 1, accountant: 1, driver: 1 },
+      large:  { storekeeper: 3, loader: 3, manager: 1, hr: 1, accountant: 1, driver: 1 },
+      huge:   { storekeeper: 3, loader: 5, manager: 1, hr: 1, accountant: 1, driver: 1 },
     }[wh.size];
 
     const current = wh.employees.filter((e) => e.role === role).length;
@@ -1531,6 +1560,7 @@ const deposit: FixedDeposit = {
       accountant:  [40_000, 70_000],
       storekeeper: [40_000, 60_000],
       loader:      [30_000, 50_000],
+      driver:      [45_000, 65_000],
     };
     const [minSal, maxSal] = salaries[role];
     const salary = Math.round(minSal + Math.random() * (maxSal - minSal));
@@ -1541,6 +1571,7 @@ const deposit: FixedDeposit = {
       accountant: 'Бухгалтер',
       storekeeper: 'Кладовщик',
       loader: 'Грузчик',
+      driver: 'Водитель',
     };
 
     const emp: WarehouseEmployee = {
@@ -1600,7 +1631,43 @@ const deposit: FixedDeposit = {
         w.id === warehouseId ? { ...w, hasTrucks: true } : w,
       ),
     }));
-    toast.success('Грузовик куплен! Теперь доставка моментальная.');
+    toast.success('Грузовик куплен', {
+      description: 'Наймите водителя — без него парк не работает',
+    });
+    return { ok: true };
+  },
+
+  payFleetInvoice: (warehouseId) => {
+    const s = get();
+    const wh = s.warehouses.find((w) => w.id === warehouseId);
+    if (!wh) return { ok: false, reason: 'Склад не найден' };
+    if (!wh.fleetInvoice) return { ok: false, reason: 'Нет неоплаченного счёта' };
+
+    const settled = settleFleetInvoice(wh, wh.fleetInvoice);
+    const cost = Math.round(settled.purchaseCost);
+
+    if (cost > 0) {
+      const tx = get().recordTransaction({
+        direction: 'expense',
+        amount: cost,
+        category: 'fleet_upkeep',
+        description: `Обслуживание парка «${wh.customName}»: топливо, запчасти, смазка`,
+        relatedEntityId: warehouseId,
+      });
+      if (!tx.ok) return { ok: false, reason: tx.reason ?? 'Недостаточно средств' };
+    }
+
+    set((st) => ({
+      warehouses: st.warehouses.map((w) =>
+        w.id === warehouseId ? { ...w, items: settled.items, fleetInvoice: undefined } : w,
+      ),
+    }));
+
+    toast.success('Счёт за парк оплачен', {
+      description: cost > 0
+        ? `Докуплено расходников на ${formatMoney(String(cost))}`
+        : 'Все расходники взяты со склада',
+    });
     return { ok: true };
   },
     checkoutCart: (items, mode, target) => {
@@ -1621,23 +1688,30 @@ const deposit: FixedDeposit = {
       return { ok: false, reason: 'Опт доступен только при покупке на склад' };
     }
 
-    // ── 3. Скидка (только для опта) + бонус от центра закупок ──
+    // ── 3. Канал 1: 1.00 × P_market × (1 − скидка), кап 20% ──
     const officeBonuses = getOfficeBonuses(s);
-    const baseDiscount = mode === 'wholesale' && wh?.hasTrucks ? 0.5 : mode === 'wholesale' ? 0.7 : 1;
-    const discount = baseDiscount * (1 - officeBonuses.purchaseDiscount);
-
-    // ── 4. Считаем стоимость и объём ──────────────
     const currentMonthForEvents = Math.floor(s.totalGameMonths);
-    let totalCost = 0;
+    const priceCtx: PriceContext = {
+      marketIndex: s.marketIndex ?? 1,
+      activeEvents: s.activeEvents ?? [],
+      monthIndex: currentMonthForEvents,
+    };
+    const hasOwnTransport = isFleetOperational(wh);
+
+    // ── 4. Стоимость товаров + наёмная доставка (+12%, мин. 2 500 ₽) ──
+    let goodsCost = 0;
     let totalQty = 0;
     for (const item of items) {
       if (item.quantity <= 0) continue;
       const res = RESOURCES_BY_ID[item.resourceId];
       if (!res) return { ok: false, reason: `Ресурс ${item.resourceId} не найден` };
-      const priceMult = getResourcePriceMultiplier(s.activeEvents ?? [], item.resourceId, currentMonthForEvents);
-      totalCost += Number(res.basePrice) * item.quantity * discount * priceMult;
+      goodsCost += getNpcUnitPrice(item.resourceId, priceCtx, officeBonuses.purchaseDiscount) * item.quantity;
       totalQty += item.quantity;
     }
+    const deliveryFee = getExternalDeliveryFee(goodsCost, hasOwnTransport);
+    const totalCost = goodsCost + deliveryFee;
+    // Доставка размазывается по себестоимости партии.
+    const landedMult = goodsCost > 0 ? totalCost / goodsCost : 1;
     if (totalQty <= 0) return { ok: false, reason: 'Некорректное количество' };
     if (moneyToNumber(s.balanceDecimal) < totalCost) {
       return { ok: false, reason: 'Недостаточно денег' };
@@ -1681,7 +1755,7 @@ const deposit: FixedDeposit = {
 
     // ── 7. Доставка: мгновенно (опт + грузовик) или через месяц ──
     const currentMonth = Math.floor(s.totalGameMonths);
-    const isInstant = mode === 'wholesale' && wh?.hasTrucks;
+    const isInstant = mode === 'wholesale' && isFleetOperational(wh);
     const arrivalAtMonth = isInstant ? currentMonth : currentMonth + 1;
 
     if (isInstant && wh) {
@@ -1690,8 +1764,7 @@ const deposit: FixedDeposit = {
       for (const item of items) {
         const res = RESOURCES_BY_ID[item.resourceId];
         if (!res) continue;
-        const priceMult = getResourcePriceMultiplier(s.activeEvents ?? [], item.resourceId, currentMonthForEvents);
-        const unitCost = Number(res.basePrice) * discount * priceMult;
+        const unitCost = getNpcUnitPrice(item.resourceId, priceCtx, officeBonuses.purchaseDiscount) * landedMult;
         const existing = newItems[item.resourceId];
         if (existing) {
           const newQty = existing.quantity + item.quantity;
@@ -1712,19 +1785,18 @@ const deposit: FixedDeposit = {
       }
       set((st) => ({
         warehouses: st.warehouses.map((w) =>
-          w.id === wh!.id ? { ...w, items: newItems } : w,
+          w.id === wh!.id
+            ? { ...w, items: newItems, fleetVolumeMonth: (w.fleetVolumeMonth ?? 0) + goodsCost }
+            : w,
         ),
       }));
-      toast.success(`Заказ доставлен мгновенно (грузовик)`, {
+      toast.success(`Заказ доставлен мгновенно (свой парк)`, {
         description: `${items.length} позиций на складе «${wh.customName}»`,
       });
     } else {
       // Доставка через месяц
       const newDeliveries: PendingDelivery[] = items.map((item) => {
-        const res = RESOURCES_BY_ID[item.resourceId];
-        const priceMult = getResourcePriceMultiplier(s.activeEvents ?? [], item.resourceId, currentMonthForEvents);
-        const cost = Number(res?.basePrice ?? 0) * item.quantity * discount * priceMult;
-        return {
+        const cost = getNpcUnitPrice(item.resourceId, priceCtx, officeBonuses.purchaseDiscount) * item.quantity * landedMult;        return {
           id: `del_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
           resourceId: item.resourceId,
           quantity: item.quantity,
@@ -1764,26 +1836,38 @@ const deposit: FixedDeposit = {
     );
     if (occupied) return { ok: false, reason: 'Помещение уже занято' };
 
-    // Расчёт стоимости
+    // Расчёт стоимости по каналу 1 (1.00 × P_market)
+    const priceCtx: PriceContext = {
+      marketIndex: s.marketIndex ?? 1,
+      activeEvents: s.activeEvents ?? [],
+      monthIndex: Math.floor(s.totalGameMonths),
+    };
+    const procDiscount = getOfficeBonuses(s).purchaseDiscount;
     const equipment = def.startingEquipment;
     const requiredEquipCost = Object.entries(def.requiredEquipment ?? {}).reduce(
-      (sum, [resId, qty]) => {
-        const res = RESOURCES_BY_ID[resId];
-        return sum + (res ? Number(res.basePrice) * qty * 0.7 : 0);
-      },
+      (sum, [resId, qty]) => sum + getNpcUnitPrice(resId, priceCtx, procDiscount) * qty,
       0,
     );
     const initialInv: Record<string, { quantity: number; averageUnitCost: Money }> = {};
     let initialCost = 0;
     for (const [resId, qty] of Object.entries(def.keyResources)) {
-      const res = RESOURCES_BY_ID[resId];
-      if (!res) continue;
-      const unitCost = Number(res.basePrice) * 0.7;
+      const unitCost = getNpcUnitPrice(resId, priceCtx, procDiscount);
       initialCost += unitCost * qty;
       initialInv[resId] = { quantity: qty, averageUnitCost: String(unitCost) };
     }
     const firstMonthRent = Math.round(premises.rentalIncome * 0.5);
-    const total = equipment + requiredEquipCost + initialCost + firstMonthRent;
+    const capexPlan = buildCapexPlan(getCapexPackage(productionId, true), s.warehouses, priceCtx, {
+      procurementDiscount: procDiscount,
+      capexDiscount: getCapexDiscount({
+        hasConstructionCo: s.businesses.some(
+          (b) => b.defId === 'construction_co' && b.status === 'operating',
+        ),
+        hasProjectBureau: s.enterprises.some(
+          (e) => e.defId === 'off_project_bureau' && e.status === 'operating',
+        ),
+      }),
+    });
+    const total = equipment + requiredEquipCost + initialCost + firstMonthRent + capexPlan.marketTotal;
 
     if (moneyToNumber(s.balanceDecimal) < total) {
       return { ok: false, reason: `Нужно ${Math.ceil(total).toLocaleString('ru-RU')} ₽` };
@@ -1819,7 +1903,10 @@ const deposit: FixedDeposit = {
       productionDistribution: {},
     };
 
-    set((st) => ({ enterprises: [...st.enterprises, runtime] }));
+    set((st) => ({
+      enterprises: [...st.enterprises, runtime],
+      warehouses: consumeCapexFromWarehouses(st.warehouses, capexPlan),
+    }));
     toast.success(`Производство открыто: ${def.name}`, {
       description: premises.name,
     });
@@ -1844,15 +1931,29 @@ const deposit: FixedDeposit = {
     );
     if (occupied) return { ok: false, reason: 'Офис уже занят' };
 
+    const priceCtx: PriceContext = {
+      marketIndex: s.marketIndex ?? 1,
+      activeEvents: s.activeEvents ?? [],
+      monthIndex: Math.floor(s.totalGameMonths),
+    };
+    const procDiscount = getOfficeBonuses(s).purchaseDiscount;
     const requiredEquipCost = Object.entries(def.requiredEquipment ?? {}).reduce(
-      (sum, [resId, qty]) => {
-        const res = RESOURCES_BY_ID[resId];
-        return sum + (res ? Number(res.basePrice) * qty * 0.7 : 0);
-      },
+      (sum, [resId, qty]) => sum + getNpcUnitPrice(resId, priceCtx, procDiscount) * qty,
       0,
     );
     const firstMonthRent = Math.round(office.rentalIncome * 0.5);
-    const total = def.startingEquipment + requiredEquipCost + firstMonthRent;
+    const capexPlan = buildCapexPlan(getCapexPackage(companyId, true), s.warehouses, priceCtx, {
+      procurementDiscount: procDiscount,
+      capexDiscount: getCapexDiscount({
+        hasConstructionCo: s.businesses.some(
+          (b) => b.defId === 'construction_co' && b.status === 'operating',
+        ),
+        hasProjectBureau: s.enterprises.some(
+          (e) => e.defId === 'off_project_bureau' && e.status === 'operating',
+        ),
+      }),
+    });
+    const total = def.startingEquipment + requiredEquipCost + firstMonthRent + capexPlan.marketTotal;
 
     if (moneyToNumber(s.balanceDecimal) < total) {
       return { ok: false, reason: `Нужно ${Math.ceil(total).toLocaleString('ru-RU')} ₽` };
@@ -1887,7 +1988,10 @@ const deposit: FixedDeposit = {
       startedAtMonth: Math.floor(s.totalGameMonths),
     };
 
-    set((st) => ({ enterprises: [...st.enterprises, runtime] }));
+    set((st) => ({
+      enterprises: [...st.enterprises, runtime],
+      warehouses: consumeCapexFromWarehouses(st.warehouses, capexPlan),
+    }));
     toast.success(`Компания открыта: ${def.name}`, {
       description: office.name,
     });
@@ -2481,6 +2585,7 @@ const deposit: FixedDeposit = {
       headOfficeId: saveData.headOfficeId ?? null,
       gameOver: saveData.gameOver ?? false,
       monthlyNpcSold: saveData.monthlyNpcSold ?? {},
+      marketIndex: saveData.marketIndex ?? 1,
     });
     // Миграция: удалённые бизнесы — вернуть деньги.
     const REMOVED_BUSINESS_IDS = [
@@ -2518,15 +2623,12 @@ const deposit: FixedDeposit = {
     // Синхронизировать clock с сохранённым totalGameMonths
     const { totalGameMonths } = get();
     if (typeof totalGameMonths === 'number') {
-      useClockStore.getState().load({
-        monthIndex: totalGameMonths,
-        monthProgressMs: 0,
-        speed: 1,
-        paused: false,
+      useClockStore.getState().load({ monthIndex: totalGameMonths });
+      // Рыночный тик месячный: индекс == номеру месяца. Догоняющих тиков нет.
+      set({
+        lastMarketTickIndex: totalGameMonths,
+        marketTickMinuteIndex: totalGameMonths,
       });
-      // Счётчик рыночных тиков привязан к totalGameMonths * 60,
-      // чтобы после загрузки не было залпа догоняющих тиков.
-      set({ lastMarketTickIndex: totalGameMonths * 60 });
     }
   },
 
@@ -2538,20 +2640,6 @@ const deposit: FixedDeposit = {
     if (s.questsDate !== key) {
       set({ quests: pickDailyQuests(Date.now()), questsDate: key });
     }
-  },
-
-  tick: (deltaSeconds) => {
-    void deltaSeconds;
-  },
-
-  buyResearch: (id: string) => {
-    const def = RESEARCH_TREE.find((r) => r.id === id);
-    if (!def) return;
-    const s = get();
-    if (s.city.research.includes(id)) return;
-    if (moneyToNumber(s.balanceDecimal) < def.cost) return;
-get().recordTransaction({ direction: 'expense', amount: def.cost, category: 'research', description: `Исследование: ${def.name}` });
-set((st) => ({ city: { ...st.city, research: [...st.city.research, id] } }));
   },
 
   buyProperty: (id) => {
@@ -2619,63 +2707,10 @@ set((st) => ({ city: { ...st.city, research: [...st.city.research, id] } }));
     if (!result.ok) return;
     set((st) => ({ ownedTransport: [...st.ownedTransport, id] }));
     toast.success(`Приобретено: «${def.name}»`, {
-      description: `−${def.offlineBonusPercent}% к кулдауну сделки · +${def.reputation.toLocaleString('ru-RU')} репутации`,
+      description: `+${def.reputation.toLocaleString('ru-RU')} репутации`,
     });
     get().pushNotification(`Приобретён транспорт: «${def.name}»`);
   },
-
-  buyConstructionPermit: () => {
-    const s = get();
-    if (s.city.constructionPermit) {
-      return { ok: false, reason: 'Разрешение уже куплено' };
-    }
-
-    const PERMIT_COST = 5_000_000;
-    if (moneyToNumber(s.balanceDecimal) < PERMIT_COST) {
-      return {
-        ok: false,
-        reason: `Нужно ${PERMIT_COST.toLocaleString('ru-RU')} ₽`,
-      };
-    }
-
-    const tx = get().recordTransaction({
-      direction: 'expense',
-      amount: PERMIT_COST,
-      category: 'city_permit',
-      description: 'Разрешение на строительство города',
-    });
-    if (!tx.ok) return { ok: false, reason: tx.reason ?? 'Ошибка' };
-
-    set((st) => ({
-      city: { ...st.city, constructionPermit: true },
-    }));
-
-    toast.success('Разрешение на строительство получено!', {
-      description: 'Режим города разблокирован',
-    });
-
-    return { ok: true };
-  },
-  buyCityBuilding: (id) => {
-    const def = CITY_BUILDINGS.find((b) => b.id === id);
-    if (!def) return;
-    const s = get();
-    if (s.city.treasury < def.price) return;
-    set((st) => {
-      const count = st.city.buildings[id] || 0;
-      return {
-        city: {
-          ...st.city,
-          treasury: st.city.treasury - def.price,
-          population: st.city.population + def.population,
-          happiness: Math.max(0, Math.min(100, st.city.happiness + def.happiness)),
-          buildings: { ...st.city.buildings, [id]: count + 1 },
-        },
-      };
-    });
-  },
-
-  setCityTaxRate: (rate) => set((st) => ({ city: { ...st.city, taxRate: Math.max(0, Math.min(50, rate)) } })),
 
   claimQuest: (id) => {
     const s = get();
@@ -2910,13 +2945,6 @@ rest: () => {
     return { income, expenses };
   },
 
-  resetCooldowns: () =>
-    set(() => ({
-      lastDealTimestamp: 0,
-    })),
-
-  setForcedHoliday: (holiday: string | null) => set({ forcedHoliday: holiday }),
-
   // ========== ФОНДОВЫЙ РЫНОК ==========
   buyShares: (companyId, shares) => {
     const s = get();
@@ -3011,6 +3039,7 @@ rest: () => {
   hardReset: () => {
     const initial = (useGameStore as any).getInitialState?.();
     if (initial) set(initial);
+    useClockStore.getState().reset();
   },
 }));
 

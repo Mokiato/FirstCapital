@@ -2,23 +2,8 @@ export type Id = string;
 export type Money = string;
 
 export interface ClockState {
-  /**
-   * Количество полностью завершённых игровых месяцев.
-   * При старте обычно равно 0.
-   */
+  /** Количество полностью завершённых игровых месяцев (== totalGameMonths). */
   monthIndex: number;
-
-  /**
-   * Прошедшее игровое время текущего месяца в миллисекундах.
-   */
-  monthProgressMs: number;
-
-  /**
-   * Скорость симуляции: 1, 2, 4 и т. п.
-   */
-  speed: number;
-
-  paused: boolean;
 }
 
 export type StockVolatility =
@@ -155,9 +140,10 @@ export interface BusinessRuntime {
    * Расходы, отражённые в учёте, но пока не оплаченные.
    */
   accruedLiabilities: Money;
-    /** Насколько бизнес «чист» перед налоговой. 0..1. Заглушка под будущую налоговую. */
+  /** Насколько бизнес «чист» перед налоговой. 0..1. Заглушка под будущую налоговую. */
   compliance?: number;
-}
+  /** Доля удовлетворения B2C-спроса в последнем месяце: 1 = полный, <1 = дефицит. */
+  demandRatio?: number;}
 
 /** Управляющий персонал — не более 1 на бизнес. */
 export const MANAGEMENT_ROLES = [

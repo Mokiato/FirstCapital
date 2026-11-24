@@ -1,25 +1,16 @@
 // src/game/simulation/clockStore.ts
-// Отдельный стор для игрового времени. Не смешивается с gameStore:
-// время — это мета-состояние, а не игровые данные.
+// Пошаговое игровое время (GDD v2.0 §3.1). Время двигается только ходом игрока.
 
 import { create } from 'zustand';
 import type { ClockState } from '../domain/types';
-import {
-  advanceClock,
-  createInitialClock,
-  setClockPaused,
-  setClockSpeed,
-} from './clock';
+import { advanceMonth, createInitialClock } from './clock';
 
 interface ClockStore {
   clock: ClockState;
 
-  setPaused: (paused: boolean) => void;
-  togglePause: () => void;
-  setSpeed: (speed: number) => void;
-  /** Продвинуть время на deltaMs, вернуть массив завершённых месяцев. */
-  advance: (deltaMs: number) => number[];
-  /** Заменить clock целиком (для загрузки сохранения). */
+  /** Завершить текущий месяц. Возвращает индекс закрытого месяца. */
+  nextMonth: () => number;
+  /** Заменить clock (загрузка сохранения). */
   load: (clock: ClockState) => void;
   reset: () => void;
 }
@@ -27,24 +18,13 @@ interface ClockStore {
 export const useClockStore = create<ClockStore>((set, get) => ({
   clock: createInitialClock(),
 
-  setPaused: (paused) =>
-    set({ clock: setClockPaused(get().clock, paused) }),
-
-  togglePause: () =>
-    set({ clock: setClockPaused(get().clock, !get().clock.paused) }),
-
-  setSpeed: (speed) =>
-    set({ clock: setClockSpeed(get().clock, speed) }),
-
-  advance: (deltaMs) => {
-    const { clock, completedMonths } = advanceClock(get().clock, deltaMs);
-    if (completedMonths.length > 0 || clock.monthProgressMs !== get().clock.monthProgressMs) {
-      set({ clock });
-    }
-    return completedMonths;
+  nextMonth: () => {
+    const next = advanceMonth(get().clock);
+    set({ clock: next });
+    return next.monthIndex;
   },
 
-  load: (clock) => set({ clock }),
+  load: (clock) => set({ clock: { monthIndex: clock.monthIndex } }),
 
   reset: () => set({ clock: createInitialClock() }),
 }));

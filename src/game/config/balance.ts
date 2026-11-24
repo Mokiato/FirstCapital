@@ -40,6 +40,11 @@ export const BALANCE = {
   /** Штраф за пропуск 1 ручной операции */
   manualOpPenalty: 0.20,
 
+  /** Ёмкость B2C-рынка на тип бизнеса: pool = baseRevenue × mult (GDD §6.3).
+   *  mult = 2.0: соло-бизнес выбирает таблицу целиком, 2-й такой же — тоже,
+   *  3-й и далее — пропорциональное насыщение. */
+  b2cMarketMult: 2.0,
+
   /** Потолки */
   maxWarehouseCapacity: 1_000_000,
   maxBusinessLevel: 20,

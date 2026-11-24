@@ -14,6 +14,10 @@ import {
 export interface BusinessMonthContext {
   supplied: boolean;
   consumedResourceCost: Money;
+  /** Себестоимость потреблённого сырья (для расчёта EBIT). */
+  resourceCost?: Money;
+  /** B2C: выручка = распределённая квота спроса (GDD §6.3). Замещает baseRevenue. */
+  allocatedRevenue?: Money;
 
   eventMultiplier?: number;
 
@@ -75,20 +79,27 @@ export function settleBusinessMonth(
   let revenue: Money = ZERO_MONEY;
 
   if (canOperate) {
-    const baseRevenue = moneyMul(
-      business.baseMonthlyRevenue,
-      business.level,
-    );
-    const combinedMultiplier =
-      business.demandMultiplier *
-      business.productivityMultiplier *
-      supplyMultiplier *
-      eventMultiplier;
+    if (context.allocatedRevenue !== undefined) {
+      // B2C: квота уже содержит уровень, штат, производительность и рыночные
+      // множители (события/конкуренты/офисы). Дефицит снабжения режет её вдвое.
+      revenue = moneyMul(context.allocatedRevenue, supplyMultiplier * eventMultiplier);
+    } else {
+      // Legacy (B2B-производства в BUSINESSES) — до пакета 4.2.
+      const baseRevenue = moneyMul(
+        business.baseMonthlyRevenue,
+        business.level,
+      );
+      const combinedMultiplier =
+        business.demandMultiplier *
+        business.productivityMultiplier *
+        supplyMultiplier *
+        eventMultiplier;
 
-    revenue = moneyMul(baseRevenue, combinedMultiplier);
+      revenue = moneyMul(baseRevenue, combinedMultiplier);
+    }
   }
 
-  const resourceCost = context.consumedResourceCost;
+  const resourceCost = context.resourceCost ?? context.consumedResourceCost;
 
   const operatingCosts = [
     business.monthlyPayroll,
@@ -97,6 +108,8 @@ export function settleBusinessMonth(
     business.monthlyMaintenance,
   ].reduce((total, cost) => moneyAdd(total, cost), ZERO_MONEY);
 
+  // GDD §9.3: EBIT = Выручка − Себестоимость − ФОТ − Аренда/ЖКХ − Обслуживание
+  // Налог 15% берётся только с положительного EBIT.
   const profitBeforeTax = moneySub(
     moneySub(revenue, resourceCost),
     operatingCosts,

@@ -1,5 +1,5 @@
-﻿export const SAVE_KEY = 'firstcapital-save-v2';
-export const SAVE_SCHEMA_VERSION = 2;
+﻿export const SAVE_KEY = 'firstcapital-save-v3';
+export const SAVE_SCHEMA_VERSION = 3;
 
 export interface SaveEnvelope<T> { schemaVersion: number; savedAt: number; payload: T; }
 export interface KeyValueStorage { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem?(key: string): void; }

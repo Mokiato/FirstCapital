@@ -2,9 +2,9 @@ import Modal from './Modal';
 import { useGameStore } from '../game/store';
 import { REAL_ESTATE } from '../data/realEstate';
 import { PRODUCTIONS } from '../data/productions';
-import { RESOURCES_BY_ID } from '../data/resources';
 import { formatMoney } from '../game/domain/money';
-
+import { getNpcUnitPrice } from '../game/economy/pricing';
+import { getOfficeBonuses } from '../game/selectors';
 export function OpenProductionModal({
   premisesId,
   onClose,
@@ -18,6 +18,22 @@ export function OpenProductionModal({
   const premises = REAL_ESTATE.find((r) => r.id === premisesId);
   if (!premises) return <Modal open={false} onClose={onClose}>{null}</Modal>;
 
+  const priceCtx = {
+    marketIndex: state.marketIndex ?? 1,
+    activeEvents: state.activeEvents ?? [],
+    monthIndex: Math.floor(state.totalGameMonths),
+  };
+  const procDiscount = getOfficeBonuses(state).purchaseDiscount;
+  const unitPriceOf = (resId: string) => getNpcUnitPrice(resId, priceCtx, procDiscount);
+  const capexDiscount = getCapexDiscount({
+    hasConstructionCo: state.businesses.some(
+      (b) => b.defId === 'construction_co' && b.status === 'operating',
+    ),
+    hasProjectBureau: state.enterprises.some(
+      (e) => e.defId === 'off_project_bureau' && e.status === 'operating',
+    ),
+  });
+
   return (
     <Modal open onClose={onClose} title={`Открыть производство: ${premises.name}`} wide>
       <div className="space-y-3 bg-[#FBF9F4] text-[#332B2B]">
@@ -29,21 +45,19 @@ export function OpenProductionModal({
           {PRODUCTIONS.map((prod) => {
             const equipCost = prod.startingEquipment;
             const reqEquipCost = Object.entries(prod.requiredEquipment ?? {}).reduce(
-              (sum, [resId, qty]) => {
-                const res = RESOURCES_BY_ID[resId];
-                return sum + (res ? Number(res.basePrice) * qty * 0.7 : 0);
-              },
+              (sum, [resId, qty]) => sum + unitPriceOf(resId) * qty,
               0,
             );
             const initialCost = Object.entries(prod.keyResources).reduce(
-              (sum, [resId, qty]) => {
-                const res = RESOURCES_BY_ID[resId];
-                return sum + (res ? Number(res.basePrice) * qty * 0.7 : 0);
-              },
+              (sum, [resId, qty]) => sum + unitPriceOf(resId) * qty,
               0,
             );
             const firstMonthRent = Math.round(premises.rentalIncome * 0.5);
-            const total = equipCost + reqEquipCost + initialCost + firstMonthRent;
+            const capexPlan = buildCapexPlan(
+              getCapexPackage(prod.id, true), state.warehouses, priceCtx,
+              { procurementDiscount: procDiscount, capexDiscount },
+            );
+            const total = equipCost + reqEquipCost + initialCost + firstMonthRent + capexPlan.marketTotal;
             const canAfford = state.balance >= total;
 
             return (
@@ -65,6 +79,12 @@ export function OpenProductionModal({
                     <div className="data-row">
                       <span className="data-label">Расходы / мес</span>
                       <span className="data-value">{formatMoney(prod.fixedCosts)}</span>
+                    </div>
+                    <div className="data-row">
+                      <span className="data-label">CAPEX-пакет</span>
+                      <span className="data-value">
+                        {capexPlan.marketTotal > 0 ? formatMoney(capexPlan.marketTotal) : 'со склада'}
+                      </span>
                     </div>
                     <div className="data-row">
                       <span className="data-label">Окупаемость</span>

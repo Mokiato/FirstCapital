@@ -2,8 +2,9 @@ import Modal from './Modal';
 import { useGameStore } from '../game/store';
 import { REAL_ESTATE } from '../data/realEstate';
 import { OFFICE_COMPANIES } from '../data/officeCompanies';
-import { RESOURCES_BY_ID } from '../data/resources';
 import { formatMoney } from '../game/domain/money';
+import { getNpcUnitPrice } from '../game/economy/pricing';
+import { getOfficeBonuses } from '../game/selectors';
 
 export function OpenOfficeCompanyModal({
   officeId,
@@ -18,6 +19,14 @@ export function OpenOfficeCompanyModal({
   const office = REAL_ESTATE.find((r) => r.id === officeId);
   if (!office) return <Modal open={false} onClose={onClose}>{null}</Modal>;
 
+  const priceCtx = {
+    marketIndex: state.marketIndex ?? 1,
+    activeEvents: state.activeEvents ?? [],
+    monthIndex: Math.floor(state.totalGameMonths),
+  };
+  const procDiscount = getOfficeBonuses(state).purchaseDiscount;
+  const unitPriceOf = (resId: string) => getNpcUnitPrice(resId, priceCtx, procDiscount);
+
   return (
     <Modal open onClose={onClose} title={`Открыть офисную компанию: ${office.name}`} wide>
       <div className="space-y-3 bg-[#FBF9F4] text-[#332B2B]">
@@ -29,10 +38,7 @@ export function OpenOfficeCompanyModal({
           {OFFICE_COMPANIES.map((comp) => {
             const equipCost = comp.startingEquipment;
             const reqEquipCost = Object.entries(comp.requiredEquipment ?? {}).reduce(
-              (sum, [resId, qty]) => {
-                const res = RESOURCES_BY_ID[resId];
-                return sum + (res ? Number(res.basePrice) * qty * 0.7 : 0);
-              },
+              (sum, [resId, qty]) => sum + unitPriceOf(resId) * qty,
               0,
             );
             const firstMonthRent = Math.round(office.rentalIncome * 0.5);

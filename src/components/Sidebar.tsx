@@ -4,7 +4,7 @@ import {
   Trophy 
 } from 'lucide-react';
 
-export type Tab = 'office' | 'businesses' | 'internet' | 'contracts' | 'rating' | 'event';
+export type Tab = 'office' | 'businesses' | 'internet' | 'contracts' | 'rating';
 
 const BASE_TABS: { id: Tab; label: string; icon: any }[] = [
   { id: 'office', label: 'Офис', icon: Building2 },
